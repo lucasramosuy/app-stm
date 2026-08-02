@@ -1,10 +1,29 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 
-	let { open = false, children }: { open?: boolean; children?: Snippet } = $props();
+	let {
+		open = false,
+		collapsed = $bindable(false),
+		children
+	}: { open?: boolean; collapsed?: boolean; children?: Snippet } = $props();
 </script>
 
-<div class="sheet" class:open>
+<button
+	class="collapse-btn"
+	class:collapsed
+	onclick={() => (collapsed = !collapsed)}
+	aria-label={collapsed ? 'Mostrar panel' : 'Ocultar panel'}
+>
+	<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+		{#if collapsed}
+			<polyline points="9 6 15 12 9 18" />
+		{:else}
+			<polyline points="15 6 9 12 15 18" />
+		{/if}
+	</svg>
+</button>
+
+<div class="sheet" class:open class:collapsed>
 	<div class="handle"></div>
 	<div class="content">
 		{#if children}
@@ -34,6 +53,63 @@
 
 	.sheet.open {
 		transform: translateY(0);
+	}
+
+	.collapse-btn {
+		display: none;
+	}
+
+	/* Pantallas anchas (desktop/tablet apaisada): panel fijo a la
+	   izquierda en vez de bandeja deslizable desde abajo, con botón
+	   para ocultarlo del todo si tapa el mapa. */
+	@media (min-width: 900px) {
+		.sheet {
+			position: fixed;
+			top: 0;
+			left: 0;
+			right: auto;
+			bottom: 0;
+			width: 380px;
+			height: 100dvh;
+			max-height: none;
+			border-radius: 0;
+			border-top: none;
+			border-right: 1px solid var(--color-border);
+			box-shadow: 4px 0 32px rgba(0, 0, 0, 0.35);
+			padding: var(--space-6) var(--space-5);
+			transform: translateX(0);
+			transition: transform 0.22s ease;
+		}
+
+		.sheet.collapsed {
+			transform: translateX(-100%);
+		}
+
+		.handle {
+			display: none;
+		}
+
+		.collapse-btn {
+			display: flex;
+			position: fixed;
+			top: var(--space-4);
+			left: calc(380px + var(--space-4));
+			z-index: 30;
+			align-items: center;
+			justify-content: center;
+			width: 36px;
+			height: 36px;
+			background: var(--color-surface);
+			border: 1px solid var(--color-border);
+			border-radius: var(--radius-sm);
+			color: var(--color-text);
+			cursor: pointer;
+			transition: left 0.22s ease;
+		}
+
+		.collapse-btn.collapsed {
+			left: var(--space-4);
+		}
 	}
 
 	.handle {
