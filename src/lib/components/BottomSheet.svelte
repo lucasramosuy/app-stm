@@ -8,21 +8,6 @@
 	}: { open?: boolean; collapsed?: boolean; children?: Snippet } = $props();
 </script>
 
-<button
-	class="collapse-btn"
-	class:collapsed
-	onclick={() => (collapsed = !collapsed)}
-	aria-label={collapsed ? 'Mostrar panel' : 'Ocultar panel'}
->
-	<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-		{#if collapsed}
-			<polyline points="9 6 15 12 9 18" />
-		{:else}
-			<polyline points="15 6 9 12 15 18" />
-		{/if}
-	</svg>
-</button>
-
 <div class="sheet" class:open class:collapsed>
 	<div class="handle"></div>
 	<div class="content">
@@ -40,6 +25,7 @@
 		left: 0;
 		right: 0;
 		bottom: 0;
+		z-index: 15;
 		background: var(--color-surface);
 		border-top: 1px solid var(--color-border);
 		border-radius: var(--radius-lg) var(--radius-lg) 0 0;
@@ -55,13 +41,9 @@
 		transform: translateY(0);
 	}
 
-	.collapse-btn {
-		display: none;
-	}
-
 	/* Pantallas anchas (desktop/tablet apaisada): panel fijo a la
-	   izquierda en vez de bandeja deslizable desde abajo, con botón
-	   para ocultarlo del todo si tapa el mapa. */
+	   izquierda en vez de bandeja deslizable desde abajo. El botón que lo
+	   colapsa vive en +page.svelte, alineado con el buscador. */
 	@media (min-width: 900px) {
 		.sheet {
 			position: fixed;
@@ -87,28 +69,6 @@
 
 		.handle {
 			display: none;
-		}
-
-		.collapse-btn {
-			display: flex;
-			position: fixed;
-			top: var(--space-4);
-			left: calc(380px + var(--space-4));
-			z-index: 30;
-			align-items: center;
-			justify-content: center;
-			width: 36px;
-			height: 36px;
-			background: var(--color-surface);
-			border: 1px solid var(--color-border);
-			border-radius: var(--radius-sm);
-			color: var(--color-text);
-			cursor: pointer;
-			transition: left 0.22s ease;
-		}
-
-		.collapse-btn.collapsed {
-			left: var(--space-4);
 		}
 	}
 

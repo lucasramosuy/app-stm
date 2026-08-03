@@ -6,6 +6,7 @@
 	import { etaToMinutes, type BusStopDetail, type UpcomingBus } from '$lib/types/stm';
 
 	const POLL_INTERVAL_MS = 12_000;
+	const SEARCH_DEBOUNCE_MS = 300;
 
 	let query = $state('');
 	let sheetOpen = $state(false);
@@ -16,6 +17,25 @@
 	let loadError = $state('');
 	let lastUpdatedAt = $state<number | null>(null);
 	let nowTick = $state(Date.now());
+	let focusLocation = $state<[number, number] | null>(null);
+
+	interface SearchStopResult {
+		busstopId: number;
+		street1: string;
+		street2: string;
+		location: { coordinates: [number, number] };
+	}
+	interface SearchLineResult {
+		line: string;
+		origin: string;
+		destination: string;
+	}
+
+	let searchResults = $state<{ stops: SearchStopResult[]; lines: SearchLineResult[] }>({
+		stops: [],
+		lines: []
+	});
+	let searchOpen = $state(false);
 
 	async function fetchUpcoming(busstopId: number, lines: string): Promise<UpcomingBus[]> {
 		const res = await fetch(`/api/busstops/${busstopId}/upcomingbuses?lines=${encodeURIComponent(lines)}`);
@@ -23,8 +43,6 @@
 		return res.json();
 	}
 
-	/** Carga inicial de una parada: trae su detalle + primeros ETAs, con
-	 * estados de loading/error visibles (el usuario está esperando esto). */
 	async function selectStop(busstopId: number) {
 		loading = true;
 		loadError = '';
@@ -44,9 +62,6 @@
 		}
 	}
 
-	/** Refresco periódico: silencioso, no toca loading/loadError. Si falla
-	 * (ej. un timeout puntual), simplemente se deja la última lista buena
-	 * en pantalla y se reintenta en el próximo ciclo. */
 	async function refreshUpcoming(busstopId: number, lines: string) {
 		try {
 			upcoming = await fetchUpcoming(busstopId, lines);
@@ -56,15 +71,19 @@
 		}
 	}
 
+	function pickStopResult(stop: SearchStopResult) {
+		searchOpen = false;
+		query = `${stop.street1} y ${stop.street2}`;
+		focusLocation = stop.location.coordinates;
+		selectStop(stop.busstopId);
+	}
+
 	// TEMP: hasta que el mapa dispare selectStop() al tocar una parada real,
 	// usamos la 3914 (18 de Julio y Andes) que ya confirmamos que tiene datos.
 	$effect(() => {
 		selectStop(3914);
 	});
 
-	// Polling: mientras haya una parada seleccionada, refresca upcomingbuses
-	// cada POLL_INTERVAL_MS. Se reinicia solo si cambia la parada (paradaId),
-	// y se limpia al desmontar o cambiar de parada.
 	$effect(() => {
 		if (!selectedStop) return;
 		const busstopId = selectedStop.paradaId;
@@ -77,13 +96,33 @@
 		return () => clearInterval(interval);
 	});
 
-	// Tick de 1s solo para que "hace Xs" se actualice en pantalla sin
-	// depender de que llegue un fetch nuevo.
 	$effect(() => {
 		const tick = setInterval(() => {
 			nowTick = Date.now();
 		}, 1000);
 		return () => clearInterval(tick);
+	});
+
+	$effect(() => {
+		const q = query.trim();
+
+		if (q.length < 2) {
+			searchResults = { stops: [], lines: [] };
+			searchOpen = false;
+			return;
+		}
+
+		searchOpen = true;
+		const timeout = setTimeout(async () => {
+			try {
+				const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+				if (res.ok) searchResults = await res.json();
+			} catch (err) {
+				console.warn('[search] falló la búsqueda', err);
+			}
+		}, SEARCH_DEBOUNCE_MS);
+
+		return () => clearTimeout(timeout);
 	});
 
 	const secondsSinceUpdate = $derived(
@@ -96,13 +135,60 @@
 </svelte:head>
 
 <main>
-	<BusMap buses={upcoming} />
+	<BusMap
+		buses={upcoming}
+		{focusLocation}
+		selectedStopId={selectedStop?.paradaId ?? null}
+		onSelectStop={selectStop}
+	/>
 
 	<div
-		class="top-bar"
-		style:--sidebar-offset={sidebarCollapsed ? '68px' : '448px'}
+		class="top-row"
+		style:--sidebar-offset={sidebarCollapsed ? '16px' : '396px'}
 	>
-		<SearchBar bind:value={query} />
+		<button
+			class="collapse-btn"
+			class:collapsed={sidebarCollapsed}
+			onclick={() => (sidebarCollapsed = !sidebarCollapsed)}
+			aria-label={sidebarCollapsed ? 'Mostrar panel' : 'Ocultar panel'}
+		>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+				{#if sidebarCollapsed}
+					<polyline points="9 6 15 12 9 18" />
+				{:else}
+					<polyline points="15 6 9 12 15 18" />
+				{/if}
+			</svg>
+		</button>
+
+		<div class="search-col">
+			<SearchBar bind:value={query} />
+
+			{#if searchOpen && (searchResults.stops.length > 0 || searchResults.lines.length > 0)}
+				<div class="search-dropdown">
+					{#if searchResults.lines.length > 0}
+						<div class="search-section-label">Líneas</div>
+						<div class="search-lines">
+							{#each searchResults.lines as l (l.line)}
+								<span class="line-chip">{l.line}</span>
+							{/each}
+						</div>
+					{/if}
+					{#if searchResults.stops.length > 0}
+						<div class="search-section-label">Paradas</div>
+						{#each searchResults.stops as stop (stop.busstopId)}
+							<button class="search-result" onclick={() => pickStopResult(stop)}>
+								{stop.street1} y {stop.street2}
+							</button>
+						{/each}
+					{/if}
+				</div>
+			{:else if searchOpen}
+				<div class="search-dropdown">
+					<p class="search-empty">Sin resultados para "{query}"</p>
+				</div>
+			{/if}
+		</div>
 	</div>
 
 	<BottomSheet open={sheetOpen} bind:collapsed={sidebarCollapsed}>
@@ -140,20 +226,116 @@
 		overflow: hidden;
 	}
 
-	.top-bar {
+	.top-row {
 		position: absolute;
 		top: env(safe-area-inset-top, 0);
 		left: 0;
 		right: 0;
 		padding: var(--space-4);
 		z-index: 10;
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+	}
+
+	.collapse-btn {
+		display: none;
+	}
+
+	.search-col {
+		flex: 1;
+		min-width: 0;
 	}
 
 	@media (min-width: 900px) {
-		.top-bar {
-			left: var(--sidebar-offset, 448px);
-			max-width: 480px;
+		.top-row {
+			left: var(--sidebar-offset, 396px);
+			right: auto;
+			transition: left 0.22s ease;
 		}
+
+		.collapse-btn {
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			width: 36px;
+			height: 36px;
+			flex-shrink: 0;
+			background: var(--color-surface);
+			border: 1px solid var(--color-border);
+			border-radius: var(--radius-sm);
+			color: var(--color-text);
+			cursor: pointer;
+		}
+
+		.search-col {
+			width: 420px;
+		}
+	}
+
+	.search-dropdown {
+		margin-top: var(--space-2);
+		background: rgba(19, 27, 46, 0.95);
+		backdrop-filter: blur(12px);
+		-webkit-backdrop-filter: blur(12px);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+		max-height: 340px;
+		overflow-y: auto;
+		padding: var(--space-2);
+	}
+
+	.search-section-label {
+		font-size: 11px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--color-text-secondary);
+		padding: var(--space-2) var(--space-2) var(--space-1);
+	}
+
+	.search-lines {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--space-2);
+		padding: 0 var(--space-2) var(--space-2);
+	}
+
+	.line-chip {
+		background: var(--color-accent);
+		color: var(--color-bg);
+		font-weight: 700;
+		font-size: 13px;
+		padding: 4px var(--space-2);
+		border-radius: var(--radius-sm);
+	}
+
+	.search-result {
+		display: block;
+		width: 100%;
+		text-align: left;
+		background: none;
+		border: none;
+		color: var(--color-text);
+		font-size: 14px;
+		font-weight: 500;
+		padding: var(--space-2);
+		border-radius: var(--radius-sm);
+		cursor: pointer;
+	}
+
+	.search-result:hover,
+	.search-result:focus-visible {
+		background: rgba(245, 246, 248, 0.06);
+	}
+
+	.search-empty {
+		color: var(--color-text-secondary);
+		font-size: 13px;
+		text-align: center;
+		padding: var(--space-3);
+		margin: 0;
 	}
 
 	.stop-header {
