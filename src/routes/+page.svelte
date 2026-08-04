@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import BusMap, { type MapBusSelection } from '$lib/components/BusMap.svelte';
 	import SearchBar from '$lib/components/SearchBar.svelte';
 	import BottomSheet from '$lib/components/BottomSheet.svelte';
@@ -6,8 +7,20 @@
 	import BusDetailCard from '$lib/components/BusDetailCard.svelte';
 	import { etaToMinutes, type BusStopDetail, type UpcomingBus } from '$lib/types/stm';
 
-	const POLL_INTERVAL_MS = 12_000;
+	const POLL_INTERVAL_MS = 20_000;
 	const SEARCH_DEBOUNCE_MS = 300;
+	const RECENT_KEY = 'app_stm_recents';
+	const FAVORITES_KEY = 'app_stm_favorites';
+
+	interface RecentItem {
+		id: string;
+		type: 'stop' | 'line';
+		title: string;
+		busstopId?: number;
+		line?: string;
+	}
+
+	type FavoriteItem = RecentItem;
 
 	let query = $state('');
 	let sheetOpen = $state(false);
@@ -18,10 +31,13 @@
 	let upcoming = $state<UpcomingBus[]>([]);
 	let loading = $state(false);
 	let loadError = $state('');
+	let isStaleData = $state(false);
 	let lastUpdatedAt = $state<number | null>(null);
 	let nowTick = $state(Date.now());
 	let focusLocation = $state<[number, number] | null>(null);
 	let selectedLine = $state<string | null>(null);
+	let recentItems = $state<RecentItem[]>([]);
+	let favoriteItems = $state<FavoriteItem[]>([]);
 
 	interface SearchStopResult {
 		busstopId: number;
@@ -41,9 +57,77 @@
 	});
 	let searchOpen = $state(false);
 
+	function updateUrl(params: { stop?: number | string | null; line?: string | null }) {
+		if (typeof window === 'undefined') return;
+		const url = new URL(window.location.href);
+		if (params.stop) {
+			url.searchParams.set('stop', String(params.stop));
+			url.searchParams.delete('line');
+		} else if (params.line) {
+			url.searchParams.set('line', params.line);
+			url.searchParams.delete('stop');
+		} else {
+			url.searchParams.delete('stop');
+			url.searchParams.delete('line');
+		}
+		window.history.replaceState({}, '', url.toString());
+	}
+
+	function saveRecent(item: RecentItem) {
+		const filtered = recentItems.filter((r) => r.id !== item.id);
+		const updated = [item, ...filtered].slice(0, 5);
+		recentItems = updated;
+		try {
+			localStorage.setItem(RECENT_KEY, JSON.stringify(updated));
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo guardar recientes', e);
+		}
+	}
+
+	function loadRecents() {
+		try {
+			const raw = localStorage.getItem(RECENT_KEY);
+			if (raw) recentItems = JSON.parse(raw);
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo leer recientes', e);
+		}
+	}
+
+	function loadFavorites() {
+		try {
+			const raw = localStorage.getItem(FAVORITES_KEY);
+			if (raw) favoriteItems = JSON.parse(raw);
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo leer favoritos', e);
+		}
+	}
+
+	function isFavorite(id: string): boolean {
+		return favoriteItems.some((f) => f.id === id);
+	}
+
+	function toggleFavorite(item: FavoriteItem) {
+		let updated: FavoriteItem[];
+		if (isFavorite(item.id)) {
+			updated = favoriteItems.filter((f) => f.id !== item.id);
+		} else {
+			updated = [item, ...favoriteItems];
+		}
+		favoriteItems = updated;
+		try {
+			localStorage.setItem(FAVORITES_KEY, JSON.stringify(updated));
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo guardar favoritos', e);
+		}
+	}
+
 	async function fetchUpcoming(busstopId: number, lines: string): Promise<UpcomingBus[]> {
 		const res = await fetch(`/api/busstops/${busstopId}/upcomingbuses?lines=${encodeURIComponent(lines)}`);
-		if (!res.ok) throw new Error('No se pudieron cargar los próximos buses');
+		isStaleData = res.headers.get('X-Data-Stale') === '1';
+		if (!res.ok) {
+			const errorData = await res.json().catch(() => ({}));
+			throw new Error(errorData.message || 'No se pudieron cargar los próximos buses');
+		}
 		return res.json();
 	}
 
@@ -54,10 +138,23 @@
 		loading = true;
 		loadError = '';
 		sheetOpen = true;
+		updateUrl({ stop: busstopId });
+
 		try {
 			const stopRes = await fetch(`/api/busstops/${busstopId}`);
+			if (stopRes.headers.get('X-Data-Stale') === '1') isStaleData = true;
 			if (!stopRes.ok) throw new Error('No se pudo cargar la parada');
+			
 			selectedStop = await stopRes.json();
+			if (selectedStop) {
+				focusLocation = selectedStop.location.coordinates;
+				saveRecent({
+					id: `stop-${busstopId}`,
+					type: 'stop',
+					title: `${selectedStop.calle1} y ${selectedStop.calle2}`,
+					busstopId
+				});
+			}
 
 			const lines = (selectedStop?.lineas ?? []).join(',');
 			upcoming = await fetchUpcoming(busstopId, lines);
@@ -70,6 +167,7 @@
 	}
 
 	async function refreshUpcoming(busstopId: number, lines: string) {
+		if (document.visibilityState === 'hidden') return;
 		try {
 			upcoming = await fetchUpcoming(busstopId, lines);
 			lastUpdatedAt = Date.now();
@@ -90,10 +188,18 @@
 		query = line;
 		clearSelection();
 		selectedLine = line;
+		updateUrl({ line });
+		saveRecent({
+			id: `line-${line}`,
+			type: 'line',
+			title: `Línea ${line}`,
+			line
+		});
 	}
 
 	function clearLineFilter() {
 		selectedLine = null;
+		updateUrl({});
 	}
 
 	function selectBusFromMap(bus: MapBusSelection) {
@@ -134,20 +240,33 @@
 		upcoming = [];
 		sheetOpen = false;
 		loadError = '';
+		updateUrl({});
 	}
 
-	// Vista inicial: arranca mostrando la parada 3914 (18 de Julio y Andes)
-	// hasta que el usuario toque otra parada en el mapa o busque una.
-	$effect(() => {
-		selectStop(3914);
+	// Deep links al montar la página (Prioridad 8, sin parada default hardcodeada)
+	onMount(() => {
+		loadRecents();
+		loadFavorites();
+		const params = new URLSearchParams(window.location.search);
+		const stopParam = params.get('stop') || params.get('parada');
+		const lineParam = params.get('line') || params.get('linea');
+
+		if (stopParam) {
+			const id = Number(stopParam);
+			if (!Number.isNaN(id)) selectStop(id);
+		} else if (lineParam) {
+			pickLineResult(lineParam);
+		}
 	});
 
 	$effect(() => {
-		if (!selectedBus || !selectedStop) return;
-		const match = upcoming.find((b) => b.busId === selectedBus.busId);
+		const bus = selectedBus;
+		if (!bus || !selectedStop) return;
+		const match = upcoming.find((b) => b.busId === bus.busId);
 		selectedBusEtaMinutes = match ? etaToMinutes(match.eta) : null;
 	});
 
+	// Polling unificado (20s) con pausado en background
 	$effect(() => {
 		if (!selectedStop) return;
 		const busstopId = selectedStop.paradaId;
@@ -157,7 +276,17 @@
 			refreshUpcoming(busstopId, lines);
 		}, POLL_INTERVAL_MS);
 
-		return () => clearInterval(interval);
+		const handleVisibility = () => {
+			if (document.visibilityState === 'visible') {
+				refreshUpcoming(busstopId, lines);
+			}
+		};
+		document.addEventListener('visibilitychange', handleVisibility);
+
+		return () => {
+			clearInterval(interval);
+			document.removeEventListener('visibilitychange', handleVisibility);
+		};
 	});
 
 	$effect(() => {
@@ -192,6 +321,10 @@
 	const secondsSinceUpdate = $derived(
 		lastUpdatedAt ? Math.max(0, Math.round((nowTick - lastUpdatedAt) / 1000)) : null
 	);
+
+	const selectedStopNameStr = $derived(
+		selectedStop ? `${selectedStop.calle1} y ${selectedStop.calle2}` : null
+	);
 </script>
 
 <svelte:head>
@@ -203,6 +336,7 @@
 		buses={upcoming}
 		{focusLocation}
 		selectedStopId={selectedStop?.paradaId ?? null}
+		selectedStopName={selectedStopNameStr}
 		selectedBusId={selectedBus?.busId ?? null}
 		filterLine={selectedLine}
 		onSelectStop={selectStop}
@@ -231,10 +365,71 @@
 		<div class="search-col">
 			<SearchBar bind:value={query} />
 
+			<!-- Recientes / Favoritos rápidos cuando no hay búsqueda activa -->
+			{#if query.trim().length === 0 && (favoriteItems.length > 0 || recentItems.length > 0) && !selectedLine}
+				<div class="quick-access-list">
+					{#if favoriteItems.length > 0}
+						<div class="recents-row favorites-row">
+							<span class="recents-label favorites-label">
+								<svg width="12" height="12" viewBox="0 0 24 24" fill="var(--color-accent)" stroke="var(--color-accent)" stroke-width="2">
+									<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+								</svg>
+								Favoritos:
+							</span>
+							{#each favoriteItems as item (item.id)}
+								<button
+									class="recent-chip favorite-chip"
+									onclick={() => {
+										if (item.type === 'stop' && item.busstopId) selectStop(item.busstopId);
+										else if (item.type === 'line' && item.line) pickLineResult(item.line);
+									}}
+								>
+									{item.title}
+								</button>
+							{/each}
+						</div>
+					{/if}
+
+					{#if recentItems.filter((r) => !isFavorite(r.id)).length > 0}
+						<div class="recents-row">
+							<span class="recents-label">Recientes:</span>
+							{#each recentItems.filter((r) => !isFavorite(r.id)) as item (item.id)}
+								<button
+									class="recent-chip"
+									onclick={() => {
+										if (item.type === 'stop' && item.busstopId) selectStop(item.busstopId);
+										else if (item.type === 'line' && item.line) pickLineResult(item.line);
+									}}
+								>
+									{item.title}
+								</button>
+							{/each}
+						</div>
+					{/if}
+				</div>
+			{/if}
+
 			{#if selectedLine}
 				<div class="active-filter">
 					<span class="line-chip small">{selectedLine}</span>
 					<span class="active-filter-text">Mostrando solo esta línea</span>
+					<button
+						class="fav-star-btn"
+						class:active={isFavorite(`line-${selectedLine}`)}
+						onclick={() =>
+							toggleFavorite({
+								id: `line-${selectedLine}`,
+								type: 'line',
+								title: `Línea ${selectedLine}`,
+								line: selectedLine!
+							})}
+						aria-label={isFavorite(`line-${selectedLine}`) ? 'Quitar de favoritos' : 'Guardar en favoritos'}
+						title={isFavorite(`line-${selectedLine}`) ? 'Quitar de favoritos' : 'Guardar en favoritos'}
+					>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill={isFavorite(`line-${selectedLine}`) ? 'var(--color-accent)' : 'none'} stroke={isFavorite(`line-${selectedLine}`) ? 'var(--color-accent)' : 'currentColor'} stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+							<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+						</svg>
+					</button>
 					<button class="close-btn" onclick={clearLineFilter} aria-label="Quitar filtro de línea">
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
 							<line x1="18" y1="6" x2="6" y2="18" />
@@ -280,7 +475,26 @@
 			<p class="status error">{loadError}</p>
 		{:else if selectedBus}
 			<div class="panel-header">
-				<h2 class="panel-title">Ómnibus en vivo</h2>
+				<div class="panel-header-left">
+					<button
+						class="fav-star-btn"
+						class:active={isFavorite(`line-${selectedBus.line}`)}
+						onclick={() =>
+							toggleFavorite({
+								id: `line-${selectedBus!.line}`,
+								type: 'line',
+								title: `Línea ${selectedBus!.line}`,
+								line: selectedBus!.line
+							})}
+						aria-label={isFavorite(`line-${selectedBus.line}`) ? 'Quitar línea de favoritos' : 'Guardar línea en favoritos'}
+						title={isFavorite(`line-${selectedBus.line}`) ? 'Quitar línea de favoritos' : 'Guardar línea en favoritos'}
+					>
+						<svg width="16" height="16" viewBox="0 0 24 24" fill={isFavorite(`line-${selectedBus.line}`) ? 'var(--color-accent)' : 'none'} stroke={isFavorite(`line-${selectedBus.line}`) ? 'var(--color-accent)' : 'currentColor'} stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+							<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+						</svg>
+					</button>
+					<h2 class="panel-title">Ómnibus en vivo</h2>
+				</div>
 				<button class="close-btn" onclick={clearBusSelection} aria-label="Cerrar ómnibus">
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
 						<line x1="18" y1="6" x2="6" y2="18" />
@@ -320,10 +534,31 @@
 			{/if}
 		{:else if selectedStop}
 			<div class="stop-header">
-				<h2 class="stop-name">{selectedStop.calle1} y {selectedStop.calle2}</h2>
+				<div class="stop-header-title">
+					<button
+						class="fav-star-btn"
+						class:active={isFavorite(`stop-${selectedStop.paradaId}`)}
+						onclick={() =>
+							toggleFavorite({
+								id: `stop-${selectedStop!.paradaId}`,
+								type: 'stop',
+								title: `${selectedStop!.calle1} y ${selectedStop!.calle2}`,
+								busstopId: selectedStop!.paradaId
+							})}
+						aria-label={isFavorite(`stop-${selectedStop.paradaId}`) ? 'Quitar parada de favoritos' : 'Guardar parada en favoritos'}
+						title={isFavorite(`stop-${selectedStop.paradaId}`) ? 'Quitar de favoritos' : 'Guardar en favoritos'}
+					>
+						<svg width="18" height="18" viewBox="0 0 24 24" fill={isFavorite(`stop-${selectedStop.paradaId}`) ? 'var(--color-accent)' : 'none'} stroke={isFavorite(`stop-${selectedStop.paradaId}`) ? 'var(--color-accent)' : 'currentColor'} stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+							<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+						</svg>
+					</button>
+					<h2 class="stop-name">{selectedStop.calle1} y {selectedStop.calle2}</h2>
+				</div>
 				<div class="stop-header-right">
 					{#if secondsSinceUpdate !== null}
-						<span class="updated tabular-nums">Actualizado hace {secondsSinceUpdate}s</span>
+						<span class="updated tabular-nums">
+							{isStaleData ? 'Datos demorados · ' : ''}hace {secondsSinceUpdate}s
+						</span>
 					{/if}
 					<button class="close-btn" onclick={clearSelection} aria-label="Cerrar parada">
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
@@ -376,6 +611,45 @@
 	.search-col {
 		flex: 1;
 		min-width: 0;
+	}
+
+	.recents-row {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		margin-top: var(--space-2);
+		overflow-x: auto;
+		padding-bottom: 2px;
+		scrollbar-width: none;
+		-ms-overflow-style: none;
+	}
+
+	.recents-row::-webkit-scrollbar {
+		display: none;
+	}
+
+	.recents-label {
+		font-size: 11px;
+		color: var(--color-text-secondary);
+		white-space: nowrap;
+		flex-shrink: 0;
+	}
+
+	.recent-chip {
+		background: rgba(19, 27, 46, 0.85);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-sm);
+		color: var(--color-text);
+		font-size: 11px;
+		padding: 3px 8px;
+		white-space: nowrap;
+		cursor: pointer;
+		transition: background 0.15s ease;
+		flex-shrink: 0;
+	}
+
+	.recent-chip:hover {
+		background: rgba(255, 255, 255, 0.12);
 	}
 
 	@media (min-width: 900px) {
@@ -475,6 +749,60 @@
 		flex: 1;
 		font-size: 12px;
 		color: var(--color-text-secondary);
+	}
+
+	.fav-star-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		background: none;
+		border: none;
+		color: var(--color-text-secondary);
+		cursor: pointer;
+		padding: 4px;
+		border-radius: var(--radius-sm);
+		transition: transform 0.15s ease, color 0.15s ease;
+	}
+
+	.fav-star-btn:hover {
+		color: var(--color-accent);
+		transform: scale(1.15);
+	}
+
+	.fav-star-btn.active {
+		color: var(--color-accent);
+	}
+
+	.quick-access-list {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+
+	.favorites-label {
+		color: var(--color-accent);
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		font-weight: 600;
+	}
+
+	.favorite-chip {
+		border-color: rgba(255, 201, 60, 0.3);
+		background: rgba(255, 201, 60, 0.08);
+	}
+
+	.favorite-chip:hover {
+		background: rgba(255, 201, 60, 0.18);
+		border-color: var(--color-accent);
+	}
+
+	.stop-header-title,
+	.panel-header-left {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		min-width: 0;
 	}
 
 	.search-result {

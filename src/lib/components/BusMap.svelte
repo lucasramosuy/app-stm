@@ -3,16 +3,10 @@
 	import { Map as MapLibreMap, NavigationControl, setWorkerUrl } from 'maplibre-gl';
 	import type { GeoJSONSource, MapGeoJSONFeature } from 'maplibre-gl';
 	import 'maplibre-gl/dist/maplibre-gl.css';
-	// Fix conocido para MapLibre GL v6 + Vite: el dependency optimizer de Vite
-	// pierde el archivo del worker si no se registra explícitamente así.
-	// ?worker&url (no ?url solo) es necesario: el worker importa un archivo
-	// hermano (maplibre-gl-shared.mjs) que ?url no arrastra.
-	// Ver: https://maplibre.org/maplibre-gl-js/docs/
 	import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 	import { buildDarkStyle } from '$lib/map/darkStyle';
 	import type { Bus, UpcomingBus } from '$lib/types/stm';
 
-	/** Datos mínimos que viajan en el GeoJSON y vuelven al hacer click. */
 	export type MapBusSelection = Pick<
 		Bus,
 		| 'busId'
@@ -44,6 +38,7 @@
 		buses = [],
 		focusLocation = null,
 		selectedStopId = null,
+		selectedStopName = null,
 		selectedBusId = null,
 		filterLine = null,
 		onSelectStop,
@@ -52,31 +47,17 @@
 		buses?: UpcomingBus[];
 		focusLocation?: [number, number] | null;
 		selectedStopId?: number | null;
+		selectedStopName?: string | null;
 		selectedBusId?: number | null;
 		filterLine?: string | null;
 		onSelectStop?: (busstopId: number) => void;
 		onSelectBus?: (bus: MapBusSelection) => void;
 	} = $props();
 
-	// Modo de qué buses mostrar en el mapa:
-	// - "line": se filtró una línea en el buscador → solo esos buses, en
-	//   toda la ciudad (no limitado al viewport).
-	// - "stop": hay una parada seleccionada → solo los buses que la sirven
-	//   (mismos datos que ya vienen en el sidebar, sin fetch propio).
-	// - "viewport": caso default → todos los buses visibles en el área
-	//   actual del mapa.
 	const busMode = $derived(filterLine ? 'line' : selectedStopId !== null ? 'stop' : 'viewport');
-
-	// Por debajo de este zoom no mostramos paradas: a nivel ciudad serían
-	// miles de puntos amontonados sin valor y con costo de red innecesario.
 	const MIN_ZOOM_FOR_STOPS = 15;
-	const BUSES_POLL_MS = 8_000;
-
-	// Centro de Montevideo (Plaza Independencia, aprox.)
+	const BUSES_POLL_MS = 15_000;
 	const MONTEVIDEO_CENTER: [number, number] = [-56.1937, -34.9058];
-
-	// Estilo base gratuito de OpenFreeMap (sin API key), reescrito a nuestra
-	// paleta oscura en tiempo real por buildDarkStyle() — ver darkStyle.ts.
 	const STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
 
 	const STOPS_SOURCE_ID = 'stops';
@@ -95,6 +76,8 @@
 
 	let debugMessage = $state<string | null>(null);
 	let tilesLoaded = $state(false);
+	let activeBusesCount = $state(0);
+	let isStaleData = $state(false);
 
 	function applySelectedHighlight() {
 		if (!map || !map.getSource(STOPS_SOURCE_ID)) return;
@@ -137,6 +120,7 @@
 
 	async function fetchAndSyncNearbyStops() {
 		if (!map) return;
+		if (document.visibilityState === 'hidden') return;
 		if (map.getZoom() < MIN_ZOOM_FOR_STOPS) {
 			clearStopMarkers();
 			return;
@@ -211,6 +195,7 @@
 
 	function syncBuses(list: LiveBus[]) {
 		if (!map) return;
+		activeBusesCount = list.length;
 		const source = map.getSource(BUSES_SOURCE_ID) as GeoJSONSource | undefined;
 		if (!source) return;
 
@@ -273,9 +258,9 @@
 		);
 	}
 
-	/** Modo "viewport": todos los buses en el área visible del mapa. */
 	async function fetchAndSyncBuses() {
 		if (!map) return;
+		if (document.visibilityState === 'hidden') return;
 
 		const bounds = map.getBounds();
 		const params = new URLSearchParams({
@@ -287,6 +272,7 @@
 
 		try {
 			const res = await fetch(`/api/buses/nearby?${params}`);
+			isStaleData = res.headers.get('X-Data-Stale') === '1';
 			if (res.ok) {
 				const list: LiveBus[] = await res.json();
 				syncBuses(list);
@@ -296,15 +282,14 @@
 		}
 	}
 
-	/** Modo "line": solo los buses de una línea, en toda la ciudad. */
 	async function fetchAndSyncBusesByLine(line: string) {
+		if (document.visibilityState === 'hidden') return;
 		try {
 			const res = await fetch(`/api/buses/by-line?line=${encodeURIComponent(line)}`);
+			isStaleData = res.headers.get('X-Data-Stale') === '1';
 			if (res.ok) {
 				const list: LiveBus[] = await res.json();
 				syncBuses(list);
-				// Solo encuadra el mapa la primera vez que se activa el filtro,
-				// no en cada refresco periódico (si no, "salta" cada 8s).
 				if (lastFitLine !== line) {
 					fitToBuses(list);
 					lastFitLine = line;
@@ -315,9 +300,6 @@
 		}
 	}
 
-	// Decide qué mostrar según el modo activo. Se dispara al montar, y cada
-	// vez que cambian selectedStopId, filterLine, o los datos de `buses`
-	// (el sidebar los refresca cada 12s con polling propio).
 	$effect(() => {
 		if (!mapReady) return;
 
@@ -350,6 +332,19 @@
 	onMount(() => {
 		let moveendTimeout: ReturnType<typeof setTimeout> | undefined;
 		let busesPollInterval: ReturnType<typeof setInterval> | undefined;
+
+		const handleVisibilityChange = () => {
+			if (document.visibilityState === 'visible' && mapReady) {
+				if (busMode === 'line' && filterLine) {
+					fetchAndSyncBusesByLine(filterLine);
+				} else if (busMode === 'viewport') {
+					fetchAndSyncBuses();
+				}
+				fetchAndSyncNearbyStops();
+			}
+		};
+
+		document.addEventListener('visibilitychange', handleVisibilityChange);
 
 		(async () => {
 			let style: string | Awaited<ReturnType<typeof buildDarkStyle>> = STYLE_URL;
@@ -465,10 +460,8 @@
 				mapReady = true;
 				fetchAndSyncNearbyStops();
 
-				// Refresco periódico: los buses se mueven aunque el mapa esté
-				// quieto. En modo "stop" no hace falta (el prop `buses` ya se
-				// refresca solo desde afuera cada 12s).
 				busesPollInterval = setInterval(() => {
+					if (document.visibilityState === 'hidden') return;
 					if (busMode === 'line' && filterLine) {
 						fetchAndSyncBusesByLine(filterLine);
 					} else if (busMode === 'viewport') {
@@ -507,6 +500,7 @@
 		return () => {
 			clearTimeout(moveendTimeout);
 			clearInterval(busesPollInterval);
+			document.removeEventListener('visibilitychange', handleVisibilityChange);
 		};
 	});
 
@@ -517,6 +511,29 @@
 
 <div class="map-container" bind:this={mapContainer}></div>
 
+<!-- Chip de Leyenda / Modo de Mapa (Prioridad 4) -->
+<div class="mode-chip">
+	{#if busMode === 'stop'}
+		<span class="dot stop-dot"></span>
+		<span class="mode-text">
+			Parada {selectedStopName ?? `#${selectedStopId}`} · <strong>{activeBusesCount}</strong> {activeBusesCount === 1 ? 'bus' : 'buses'} aproximándose
+		</span>
+	{:else if busMode === 'line'}
+		<span class="dot line-dot"></span>
+		<span class="mode-text">
+			Línea <strong>{filterLine}</strong> · <strong>{activeBusesCount}</strong> {activeBusesCount === 1 ? 'bus' : 'buses'} en la ciudad
+		</span>
+	{:else}
+		<span class="dot view-dot"></span>
+		<span class="mode-text">
+			Zona visible · <strong>{activeBusesCount}</strong> {activeBusesCount === 1 ? 'bus' : 'buses'} en pantalla
+		</span>
+	{/if}
+	{#if isStaleData}
+		<span class="stale-badge" title="Respondiendo datos cacheados por demora de STM">Demorado</span>
+	{/if}
+</div>
+
 {#if debugMessage}
 	<div class="debug-banner">{debugMessage}</div>
 {/if}
@@ -526,6 +543,67 @@
 		position: absolute;
 		inset: 0;
 		z-index: 0;
+	}
+
+	.mode-chip {
+		position: absolute;
+		bottom: var(--space-4);
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 10;
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		background: rgba(19, 27, 46, 0.88);
+		backdrop-filter: blur(12px);
+		-webkit-backdrop-filter: blur(12px);
+		border: 1px solid var(--color-border);
+		border-radius: 9999px;
+		padding: 6px 14px;
+		color: var(--color-text);
+		font-size: 12px;
+		white-space: nowrap;
+		box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+		pointer-events: none;
+	}
+
+	@media (min-width: 900px) {
+		.mode-chip {
+			bottom: var(--space-5);
+			left: calc(380px + (100% - 380px) / 2);
+		}
+	}
+
+	.dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		flex-shrink: 0;
+	}
+
+	.stop-dot {
+		background: #FFC93C;
+		box-shadow: 0 0 6px #FFC93C;
+	}
+
+	.line-dot {
+		background: #5eead4;
+		box-shadow: 0 0 6px #5eead4;
+	}
+
+	.view-dot {
+		background: #60a5fa;
+		box-shadow: 0 0 6px #60a5fa;
+	}
+
+	.stale-badge {
+		background: #f59e0b;
+		color: #0b1220;
+		font-weight: 700;
+		font-size: 10px;
+		padding: 1px 6px;
+		border-radius: 4px;
+		text-transform: uppercase;
 	}
 
 	.debug-banner {

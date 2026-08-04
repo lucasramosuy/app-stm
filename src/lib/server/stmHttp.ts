@@ -1,5 +1,6 @@
 import { json, type NumericRange } from '@sveltejs/kit';
 import { StmDataUnavailableError, type StmCacheResult } from './stmCache';
+import { StmApiError } from './stmApi';
 
 export const STM_STALE_HEADER = 'X-Data-Stale';
 
@@ -22,12 +23,23 @@ export function jsonFromStmCache<T>(
 	});
 }
 
-export function errorFromStmFailure(err: unknown): ReturnType<typeof json> | null {
+export function handleStmError(err: unknown): ReturnType<typeof json> {
 	if (err instanceof StmDataUnavailableError) {
 		return json(
-			{ message: err.message, retryAfterMs: err.retryAfterMs },
+			{ error: 'data_unavailable', message: err.message, retryAfterMs: err.retryAfterMs },
 			{ status: err.httpStatus as NumericRange<400, 599> }
 		);
 	}
-	return null;
+	if (err instanceof StmApiError) {
+		const status = err.status >= 400 && err.status < 600 ? err.status : 503;
+		return json(
+			{ error: 'stm_api_error', message: err.message, status: err.status },
+			{ status: status as NumericRange<400, 599> }
+		);
+	}
+	console.error('[API Handler Error]', err);
+	return json(
+		{ error: 'internal_error', message: 'Error interno al procesar la solicitud' },
+		{ status: 500 }
+	);
 }
