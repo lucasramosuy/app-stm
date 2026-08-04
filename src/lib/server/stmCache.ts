@@ -1,5 +1,5 @@
 import { stmFetch } from './stmApi';
-import type { LineVariant, BusStopListItem, BusStopDetail, UpcomingBus } from '$lib/types/stm';
+import type { LineVariant, BusStopListItem, BusStopDetail, UpcomingBus, Bus } from '$lib/types/stm';
 
 // Datos estáticos (líneas y paradas cambian con muy poca frecuencia).
 // Se cachean en memoria del proceso para que el buscador no tenga que
@@ -101,4 +101,29 @@ const upcomingCache = makeKeyedGetter<UpcomingBus[]>(UPCOMING_TTL_MS, async (key
 
 export function getUpcomingBuses(busstopId: number | string, lines: string): Promise<UpcomingBus[]> {
 	return upcomingCache(`${busstopId}::${lines}`);
+}
+
+// Flota completa (GET /buses, sin filtro geográfico): cambia todo el
+// tiempo, TTL bien corto (5s) solo para absorber ráfagas de varias
+// pestañas/usuarios pidiendo casi al mismo tiempo, no para "ahorrar"
+// frescura real.
+let allBusesCache: Cache<Bus[]> = { data: null, fetchedAt: 0, inFlight: null };
+const ALL_BUSES_TTL_MS = 5_000;
+
+export async function getAllBuses(): Promise<Bus[]> {
+	const isFresh = allBusesCache.data !== null && Date.now() - allBusesCache.fetchedAt < ALL_BUSES_TTL_MS;
+	if (isFresh) return allBusesCache.data as Bus[];
+
+	if (!allBusesCache.inFlight) {
+		allBusesCache.inFlight = (stmFetch('/buses') as Promise<Bus[]>)
+			.then((data) => {
+				allBusesCache = { data, fetchedAt: Date.now(), inFlight: null };
+				return data;
+			})
+			.finally(() => {
+				allBusesCache.inFlight = null;
+			});
+	}
+
+	return allBusesCache.inFlight;
 }

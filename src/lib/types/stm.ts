@@ -66,6 +66,25 @@ export interface UpcomingBus {
 	};
 }
 
+/** Forma real de GET /buses (flota completa, sin filtro geográfico). */
+export interface Bus {
+	eType: string;
+	company: string;
+	timestamp: string;
+	busId: number;
+	line: string;
+	lineVariantId: number;
+	location: { type: 'Point'; coordinates: [number, number] };
+	origin: string;
+	destination: string;
+	subline: string;
+	special: boolean;
+	speed: number;
+	access: string;
+	thermalConfort: string;
+	emissions: string;
+}
+
 export interface BusGeoFeature {
 	type: 'Feature';
 	properties: {

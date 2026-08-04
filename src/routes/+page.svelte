@@ -18,6 +18,7 @@
 	let lastUpdatedAt = $state<number | null>(null);
 	let nowTick = $state(Date.now());
 	let focusLocation = $state<[number, number] | null>(null);
+	let selectedLine = $state<string | null>(null);
 
 	interface SearchStopResult {
 		busstopId: number;
@@ -44,6 +45,7 @@
 	}
 
 	async function selectStop(busstopId: number) {
+		selectedLine = null;
 		loading = true;
 		loadError = '';
 		sheetOpen = true;
@@ -78,8 +80,26 @@
 		selectStop(stop.busstopId);
 	}
 
-	// TEMP: hasta que el mapa dispare selectStop() al tocar una parada real,
-	// usamos la 3914 (18 de Julio y Andes) que ya confirmamos que tiene datos.
+	function pickLineResult(line: string) {
+		searchOpen = false;
+		query = line;
+		clearSelection();
+		selectedLine = line;
+	}
+
+	function clearLineFilter() {
+		selectedLine = null;
+	}
+
+	function clearSelection() {
+		selectedStop = null;
+		upcoming = [];
+		sheetOpen = false;
+		loadError = '';
+	}
+
+	// Vista inicial: arranca mostrando la parada 3914 (18 de Julio y Andes)
+	// hasta que el usuario toque otra parada en el mapa o busque una.
 	$effect(() => {
 		selectStop(3914);
 	});
@@ -139,6 +159,7 @@
 		buses={upcoming}
 		{focusLocation}
 		selectedStopId={selectedStop?.paradaId ?? null}
+		filterLine={selectedLine}
 		onSelectStop={selectStop}
 	/>
 
@@ -164,13 +185,28 @@
 		<div class="search-col">
 			<SearchBar bind:value={query} />
 
+			{#if selectedLine}
+				<div class="active-filter">
+					<span class="line-chip small">{selectedLine}</span>
+					<span class="active-filter-text">Mostrando solo esta línea</span>
+					<button class="close-btn" onclick={clearLineFilter} aria-label="Quitar filtro de línea">
+						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+							<line x1="18" y1="6" x2="6" y2="18" />
+							<line x1="6" y1="6" x2="18" y2="18" />
+						</svg>
+					</button>
+				</div>
+			{/if}
+
 			{#if searchOpen && (searchResults.stops.length > 0 || searchResults.lines.length > 0)}
 				<div class="search-dropdown">
 					{#if searchResults.lines.length > 0}
 						<div class="search-section-label">Líneas</div>
 						<div class="search-lines">
 							{#each searchResults.lines as l (l.line)}
-								<span class="line-chip">{l.line}</span>
+								<button class="line-chip line-chip-btn" onclick={() => pickLineResult(l.line)}>
+									{l.line}
+								</button>
 							{/each}
 						</div>
 					{/if}
@@ -199,9 +235,17 @@
 		{:else if selectedStop}
 			<div class="stop-header">
 				<h2 class="stop-name">{selectedStop.calle1} y {selectedStop.calle2}</h2>
-				{#if secondsSinceUpdate !== null}
-					<span class="updated tabular-nums">Actualizado hace {secondsSinceUpdate}s</span>
-				{/if}
+				<div class="stop-header-right">
+					{#if secondsSinceUpdate !== null}
+						<span class="updated tabular-nums">Actualizado hace {secondsSinceUpdate}s</span>
+					{/if}
+					<button class="close-btn" onclick={clearSelection} aria-label="Cerrar parada">
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+							<line x1="18" y1="6" x2="6" y2="18" />
+							<line x1="6" y1="6" x2="18" y2="18" />
+						</svg>
+					</button>
+				</div>
 			</div>
 			{#if upcoming.length === 0}
 				<p class="status">No hay buses acercándose ahora mismo.</p>
@@ -311,6 +355,41 @@
 		border-radius: var(--radius-sm);
 	}
 
+	.line-chip-btn {
+		border: none;
+		cursor: pointer;
+		font-family: var(--font-sans);
+		transition: transform 0.1s ease;
+	}
+
+	.line-chip-btn:hover {
+		transform: scale(1.08);
+	}
+
+	.line-chip.small {
+		font-size: 12px;
+		padding: 3px 6px;
+	}
+
+	.active-filter {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		margin-top: var(--space-2);
+		background: rgba(19, 27, 46, 0.95);
+		backdrop-filter: blur(12px);
+		-webkit-backdrop-filter: blur(12px);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		padding: var(--space-2) var(--space-3);
+	}
+
+	.active-filter-text {
+		flex: 1;
+		font-size: 12px;
+		color: var(--color-text-secondary);
+	}
+
 	.search-result {
 		display: block;
 		width: 100%;
@@ -350,6 +429,31 @@
 		font-size: 17px;
 		font-weight: 700;
 		margin: 0;
+	}
+
+	.stop-header-right {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		flex-shrink: 0;
+	}
+
+	.close-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 24px;
+		height: 24px;
+		background: none;
+		border: none;
+		color: var(--color-text-secondary);
+		cursor: pointer;
+		border-radius: var(--radius-sm);
+	}
+
+	.close-btn:hover {
+		background: rgba(245, 246, 248, 0.08);
+		color: var(--color-text);
 	}
 
 	.updated {

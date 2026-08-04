@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { Map as MapLibreMap, Marker, NavigationControl, setWorkerUrl } from 'maplibre-gl';
+	import { Map as MapLibreMap, NavigationControl, setWorkerUrl } from 'maplibre-gl';
+	import type { GeoJSONSource, MapGeoJSONFeature } from 'maplibre-gl';
 	import 'maplibre-gl/dist/maplibre-gl.css';
 	// Fix conocido para MapLibre GL v6 + Vite: el dependency optimizer de Vite
 	// pierde el archivo del worker si no se registra explícitamente así.
@@ -8,10 +9,8 @@
 	// hermano (maplibre-gl-shared.mjs) que ?url no arrastra.
 	// Ver: https://maplibre.org/maplibre-gl-js/docs/
 	import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
-	import type { UpcomingBus } from '$lib/types/stm';
 	import { buildDarkStyle } from '$lib/map/darkStyle';
-
-	setWorkerUrl(workerUrl);
+	import type { UpcomingBus } from '$lib/types/stm';
 
 	interface NearbyStop {
 		busstopId: number;
@@ -20,21 +19,41 @@
 		location: { coordinates: [number, number] };
 	}
 
+	interface LiveBus {
+		busId: number;
+		line: string;
+		location: { coordinates: [number, number] };
+	}
+
+	setWorkerUrl(workerUrl);
+
 	let {
 		buses = [],
 		focusLocation = null,
 		selectedStopId = null,
+		filterLine = null,
 		onSelectStop
 	}: {
 		buses?: UpcomingBus[];
 		focusLocation?: [number, number] | null;
 		selectedStopId?: number | null;
+		filterLine?: string | null;
 		onSelectStop?: (busstopId: number) => void;
 	} = $props();
+
+	// Modo de qué buses mostrar en el mapa:
+	// - "line": se filtró una línea en el buscador → solo esos buses, en
+	//   toda la ciudad (no limitado al viewport).
+	// - "stop": hay una parada seleccionada → solo los buses que la sirven
+	//   (mismos datos que ya vienen en el sidebar, sin fetch propio).
+	// - "viewport": caso default → todos los buses visibles en el área
+	//   actual del mapa.
+	const busMode = $derived(filterLine ? 'line' : selectedStopId !== null ? 'stop' : 'viewport');
 
 	// Por debajo de este zoom no mostramos paradas: a nivel ciudad serían
 	// miles de puntos amontonados sin valor y con costo de red innecesario.
 	const MIN_ZOOM_FOR_STOPS = 15;
+	const BUSES_POLL_MS = 8_000;
 
 	// Centro de Montevideo (Plaza Independencia, aprox.)
 	const MONTEVIDEO_CENTER: [number, number] = [-56.1937, -34.9058];
@@ -43,94 +62,59 @@
 	// paleta oscura en tiempo real por buildDarkStyle() — ver darkStyle.ts.
 	const STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
 
+	const STOPS_SOURCE_ID = 'stops';
+	const STOPS_LAYER_ID = 'stops-layer';
+	const BUSES_SOURCE_ID = 'live-buses';
+	const BUSES_CIRCLE_LAYER_ID = 'live-buses-circle';
+	const BUSES_LABEL_LAYER_ID = 'live-buses-label';
+
 	let mapContainer: HTMLDivElement;
 	let map: MapLibreMap | undefined;
 	let mapReady = $state(false);
 
-	const busMarkers = new Map<number, Marker>();
-	const stopMarkers = new Map<number, { marker: Marker; el: HTMLDivElement }>();
+	let highlightedStopId: number | null = null;
+	let lastFitLine: string | null = null;
 
 	let debugMessage = $state<string | null>(null);
 	let tilesLoaded = $state(false);
 
-	function busMarkerElement(bus: UpcomingBus): HTMLDivElement {
-		const el = document.createElement('div');
-		el.className = 'bus-marker';
-		el.textContent = bus.line;
-		return el;
-	}
+	function applySelectedHighlight() {
+		if (!map || !map.getSource(STOPS_SOURCE_ID)) return;
 
-	function syncBusMarkers(list: UpcomingBus[]) {
-		if (!map) return;
-
-		const seenIds = new Set<number>();
-
-		for (const bus of list) {
-			seenIds.add(bus.busId);
-			const [lon, lat] = bus.location.coordinates;
-			const existing = busMarkers.get(bus.busId);
-
-			if (existing) {
-				existing.setLngLat([lon, lat]);
-			} else {
-				const marker = new Marker({ element: busMarkerElement(bus) })
-					.setLngLat([lon, lat])
-					.addTo(map);
-				busMarkers.set(bus.busId, marker);
-			}
+		if (highlightedStopId !== null) {
+			map.setFeatureState({ source: STOPS_SOURCE_ID, id: highlightedStopId }, { selected: false });
 		}
-
-		for (const [busId, marker] of busMarkers) {
-			if (!seenIds.has(busId)) {
-				marker.remove();
-				busMarkers.delete(busId);
-			}
+		if (selectedStopId !== null) {
+			map.setFeatureState({ source: STOPS_SOURCE_ID, id: selectedStopId }, { selected: true });
 		}
-	}
-
-	function stopMarkerElement(stop: NearbyStop): HTMLDivElement {
-		const el = document.createElement('div');
-		el.className = 'stop-marker';
-		el.title = `${stop.street1} y ${stop.street2}`;
-		el.setAttribute('role', 'button');
-		el.setAttribute('aria-label', `Parada: ${stop.street1} y ${stop.street2}`);
-		el.addEventListener('click', (e) => {
-			e.stopPropagation();
-			onSelectStop?.(stop.busstopId);
-		});
-		return el;
+		highlightedStopId = selectedStopId;
 	}
 
 	function syncStopMarkers(list: NearbyStop[]) {
 		if (!map) return;
+		const source = map.getSource(STOPS_SOURCE_ID) as GeoJSONSource | undefined;
+		if (!source) return;
 
-		const seenIds = new Set<number>();
+		source.setData({
+			type: 'FeatureCollection',
+			features: list.map((stop) => ({
+				type: 'Feature',
+				id: stop.busstopId,
+				properties: {
+					busstopId: stop.busstopId,
+					street1: stop.street1,
+					street2: stop.street2
+				},
+				geometry: { type: 'Point', coordinates: stop.location.coordinates }
+			}))
+		});
 
-		for (const stop of list) {
-			seenIds.add(stop.busstopId);
-			const [lon, lat] = stop.location.coordinates;
-			const existing = stopMarkers.get(stop.busstopId);
-
-			if (existing) {
-				existing.marker.setLngLat([lon, lat]);
-			} else {
-				const el = stopMarkerElement(stop);
-				const marker = new Marker({ element: el }).setLngLat([lon, lat]).addTo(map);
-				stopMarkers.set(stop.busstopId, { marker, el });
-			}
-		}
-
-		for (const [busstopId, { marker }] of stopMarkers) {
-			if (!seenIds.has(busstopId)) {
-				marker.remove();
-				stopMarkers.delete(busstopId);
-			}
-		}
+		applySelectedHighlight();
 	}
 
 	function clearStopMarkers() {
-		for (const { marker } of stopMarkers.values()) marker.remove();
-		stopMarkers.clear();
+		const source = map?.getSource(STOPS_SOURCE_ID) as GeoJSONSource | undefined;
+		source?.setData({ type: 'FeatureCollection', features: [] });
 	}
 
 	async function fetchAndSyncNearbyStops() {
@@ -159,18 +143,105 @@
 		}
 	}
 
-	// Marca visualmente cuál parada está seleccionada (sin refetch: solo
-	// toca el className de los elementos ya en pantalla).
+	function syncBuses(list: LiveBus[]) {
+		if (!map) return;
+		const source = map.getSource(BUSES_SOURCE_ID) as GeoJSONSource | undefined;
+		if (!source) return;
+
+		source.setData({
+			type: 'FeatureCollection',
+			features: list.map((bus) => ({
+				type: 'Feature',
+				id: bus.busId,
+				properties: { busId: bus.busId, line: bus.line },
+				geometry: { type: 'Point', coordinates: bus.location.coordinates }
+			}))
+		});
+	}
+
+	function fitToBuses(list: LiveBus[]) {
+		if (!map || list.length === 0) return;
+		let minLng = Infinity;
+		let minLat = Infinity;
+		let maxLng = -Infinity;
+		let maxLat = -Infinity;
+		for (const bus of list) {
+			const [lng, lat] = bus.location.coordinates;
+			minLng = Math.min(minLng, lng);
+			maxLng = Math.max(maxLng, lng);
+			minLat = Math.min(minLat, lat);
+			maxLat = Math.max(maxLat, lat);
+		}
+		map.fitBounds(
+			[
+				[minLng, minLat],
+				[maxLng, maxLat]
+			],
+			{ padding: 80, maxZoom: 15, duration: 900 }
+		);
+	}
+
+	/** Modo "viewport": todos los buses en el área visible del mapa. */
+	async function fetchAndSyncBuses() {
+		if (!map) return;
+
+		const bounds = map.getBounds();
+		const params = new URLSearchParams({
+			minLat: String(bounds.getSouth()),
+			minLng: String(bounds.getWest()),
+			maxLat: String(bounds.getNorth()),
+			maxLng: String(bounds.getEast())
+		});
+
+		try {
+			const res = await fetch(`/api/buses/nearby?${params}`);
+			if (res.ok) {
+				const list: LiveBus[] = await res.json();
+				syncBuses(list);
+			}
+		} catch (err) {
+			console.warn('[BusMap] no se pudieron cargar buses cercanos', err);
+		}
+	}
+
+	/** Modo "line": solo los buses de una línea, en toda la ciudad. */
+	async function fetchAndSyncBusesByLine(line: string) {
+		try {
+			const res = await fetch(`/api/buses/by-line?line=${encodeURIComponent(line)}`);
+			if (res.ok) {
+				const list: LiveBus[] = await res.json();
+				syncBuses(list);
+				// Solo encuadra el mapa la primera vez que se activa el filtro,
+				// no en cada refresco periódico (si no, "salta" cada 8s).
+				if (lastFitLine !== line) {
+					fitToBuses(list);
+					lastFitLine = line;
+				}
+			}
+		} catch (err) {
+			console.warn('[BusMap] no se pudieron cargar buses de la línea', err);
+		}
+	}
+
+	// Decide qué mostrar según el modo activo. Se dispara al montar, y cada
+	// vez que cambian selectedStopId, filterLine, o los datos de `buses`
+	// (el sidebar los refresca cada 12s con polling propio).
 	$effect(() => {
-		for (const [busstopId, { el }] of stopMarkers) {
-			el.classList.toggle('selected', busstopId === selectedStopId);
+		if (!mapReady) return;
+
+		if (busMode === 'stop') {
+			syncBuses(buses.map((b) => ({ busId: b.busId, line: b.line, location: b.location })));
+		} else if (busMode === 'line' && filterLine) {
+			fetchAndSyncBusesByLine(filterLine);
+		} else {
+			lastFitLine = null;
+			fetchAndSyncBuses();
 		}
 	});
 
 	$effect(() => {
-		if (mapReady) {
-			syncBusMarkers(buses);
-		}
+		selectedStopId;
+		applySelectedHighlight();
 	});
 
 	$effect(() => {
@@ -180,6 +251,9 @@
 	});
 
 	onMount(() => {
+		let moveendTimeout: ReturnType<typeof setTimeout> | undefined;
+		let busesPollInterval: ReturnType<typeof setInterval> | undefined;
+
 		(async () => {
 			let style: string | Awaited<ReturnType<typeof buildDarkStyle>> = STYLE_URL;
 			try {
@@ -187,8 +261,6 @@
 				const baseStyle = await res.json();
 				style = buildDarkStyle(baseStyle);
 			} catch (err) {
-				// Si falla el fetch/transformación, seguimos con la URL original
-				// (queda con los colores default de Liberty) en vez de romper el mapa.
 				console.warn('[BusMap] no se pudo generar el estilo oscuro, uso el default', err);
 			}
 
@@ -204,14 +276,93 @@
 			map.addControl(new NavigationControl({ showCompass: false }), 'bottom-right');
 
 			map.on('load', () => {
+				if (!map) return;
+
+				map.addSource(STOPS_SOURCE_ID, {
+					type: 'geojson',
+					data: { type: 'FeatureCollection', features: [] }
+				});
+				map.addLayer({
+					id: STOPS_LAYER_ID,
+					type: 'circle',
+					source: STOPS_SOURCE_ID,
+					paint: {
+						'circle-radius': ['case', ['boolean', ['feature-state', 'selected'], false], 8, 6],
+						'circle-color': [
+							'case',
+							['boolean', ['feature-state', 'selected'], false],
+							'#FFC93C',
+							'#9aa3b2'
+						],
+						'circle-stroke-color': '#0B1220',
+						'circle-stroke-width': 2
+					}
+				});
+
+				map.addSource(BUSES_SOURCE_ID, {
+					type: 'geojson',
+					data: { type: 'FeatureCollection', features: [] }
+				});
+				map.addLayer({
+					id: BUSES_CIRCLE_LAYER_ID,
+					type: 'circle',
+					source: BUSES_SOURCE_ID,
+					paint: {
+						'circle-radius': 10,
+						'circle-color': '#FFC93C',
+						'circle-stroke-color': '#0B1220',
+						'circle-stroke-width': 2
+					}
+				});
+				map.addLayer({
+					id: BUSES_LABEL_LAYER_ID,
+					type: 'symbol',
+					source: BUSES_SOURCE_ID,
+					layout: {
+						'text-field': ['get', 'line'],
+						'text-font': ['Noto Sans Bold'],
+						'text-size': 10,
+						'text-allow-overlap': true,
+						'text-ignore-placement': true
+					},
+					paint: { 'text-color': '#0B1220' }
+				});
+
+				map.on('click', STOPS_LAYER_ID, (e) => {
+					const feature = e.features?.[0] as MapGeoJSONFeature | undefined;
+					const busstopId = feature?.properties?.busstopId;
+					if (typeof busstopId === 'number') {
+						onSelectStop?.(busstopId);
+					}
+				});
+				map.on('mouseenter', STOPS_LAYER_ID, () => {
+					if (map) map.getCanvas().style.cursor = 'pointer';
+				});
+				map.on('mouseleave', STOPS_LAYER_ID, () => {
+					if (map) map.getCanvas().style.cursor = '';
+				});
+
 				mapReady = true;
 				fetchAndSyncNearbyStops();
+
+				// Refresco periódico: los buses se mueven aunque el mapa esté
+				// quieto. En modo "stop" no hace falta (el prop `buses` ya se
+				// refresca solo desde afuera cada 12s).
+				busesPollInterval = setInterval(() => {
+					if (busMode === 'line' && filterLine) {
+						fetchAndSyncBusesByLine(filterLine);
+					} else if (busMode === 'viewport') {
+						fetchAndSyncBuses();
+					}
+				}, BUSES_POLL_MS);
 			});
 
-			let moveendTimeout: ReturnType<typeof setTimeout> | undefined;
 			map.on('moveend', () => {
 				clearTimeout(moveendTimeout);
-				moveendTimeout = setTimeout(fetchAndSyncNearbyStops, 250);
+				moveendTimeout = setTimeout(() => {
+					fetchAndSyncNearbyStops();
+					if (busMode === 'viewport') fetchAndSyncBuses();
+				}, 250);
 			});
 
 			map.on('error', (e) => {
@@ -232,12 +383,14 @@
 				}
 			}, 6000);
 		})();
+
+		return () => {
+			clearTimeout(moveendTimeout);
+			clearInterval(busesPollInterval);
+		};
 	});
 
 	onDestroy(() => {
-		for (const marker of busMarkers.values()) marker.remove();
-		busMarkers.clear();
-		clearStopMarkers();
 		map?.remove();
 	});
 </script>
@@ -253,50 +406,6 @@
 		position: absolute;
 		inset: 0;
 		z-index: 0;
-	}
-
-	.map-container :global(.bus-marker) {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		min-width: 34px;
-		height: 26px;
-		padding: 0 var(--space-2);
-		background: var(--color-accent);
-		color: var(--color-bg);
-		font-family: var(--font-sans);
-		font-weight: 700;
-		font-size: 12px;
-		border-radius: 999px;
-		border: 2px solid var(--color-bg);
-		box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
-		cursor: pointer;
-		z-index: 2;
-	}
-
-	.map-container :global(.stop-marker) {
-		width: 12px;
-		height: 12px;
-		border-radius: 50%;
-		background: var(--color-text-secondary);
-		border: 2px solid var(--color-bg);
-		box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
-		cursor: pointer;
-		z-index: 1;
-		transition:
-			background 0.15s ease,
-			transform 0.15s ease;
-	}
-
-	.map-container :global(.stop-marker:hover) {
-		background: var(--color-text);
-		transform: scale(1.3);
-	}
-
-	.map-container :global(.stop-marker.selected) {
-		background: var(--color-accent);
-		width: 16px;
-		height: 16px;
 	}
 
 	.debug-banner {
