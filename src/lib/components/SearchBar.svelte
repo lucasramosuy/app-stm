@@ -35,13 +35,13 @@
 		display: flex;
 		align-items: center;
 		gap: var(--space-2);
-		background: rgba(19, 27, 46, 0.8);
-		backdrop-filter: blur(12px);
-		-webkit-backdrop-filter: blur(12px);
-		border: 1px solid var(--color-border);
+		background: rgba(19, 27, 46, 0.88);
+		backdrop-filter: blur(16px);
+		-webkit-backdrop-filter: blur(16px);
+		border: 1px solid var(--color-border-strong);
 		border-radius: var(--radius-lg);
 		padding: var(--space-3) var(--space-4);
-		box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+		box-shadow: var(--shadow-float);
 	}
 
 	.icon {

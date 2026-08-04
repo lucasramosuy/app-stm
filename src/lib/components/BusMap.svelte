@@ -10,7 +10,24 @@
 	// Ver: https://maplibre.org/maplibre-gl-js/docs/
 	import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 	import { buildDarkStyle } from '$lib/map/darkStyle';
-	import type { UpcomingBus } from '$lib/types/stm';
+	import type { Bus, UpcomingBus } from '$lib/types/stm';
+
+	/** Datos mínimos que viajan en el GeoJSON y vuelven al hacer click. */
+	export type MapBusSelection = Pick<
+		Bus,
+		| 'busId'
+		| 'line'
+		| 'origin'
+		| 'destination'
+		| 'subline'
+		| 'special'
+		| 'company'
+		| 'speed'
+		| 'access'
+		| 'thermalConfort'
+		| 'emissions'
+		| 'location'
+	>;
 
 	interface NearbyStop {
 		busstopId: number;
@@ -19,11 +36,7 @@
 		location: { coordinates: [number, number] };
 	}
 
-	interface LiveBus {
-		busId: number;
-		line: string;
-		location: { coordinates: [number, number] };
-	}
+	type LiveBus = MapBusSelection;
 
 	setWorkerUrl(workerUrl);
 
@@ -31,14 +44,18 @@
 		buses = [],
 		focusLocation = null,
 		selectedStopId = null,
+		selectedBusId = null,
 		filterLine = null,
-		onSelectStop
+		onSelectStop,
+		onSelectBus
 	}: {
 		buses?: UpcomingBus[];
 		focusLocation?: [number, number] | null;
 		selectedStopId?: number | null;
+		selectedBusId?: number | null;
 		filterLine?: string | null;
 		onSelectStop?: (busstopId: number) => void;
+		onSelectBus?: (bus: MapBusSelection) => void;
 	} = $props();
 
 	// Modo de qué buses mostrar en el mapa:
@@ -73,6 +90,7 @@
 	let mapReady = $state(false);
 
 	let highlightedStopId: number | null = null;
+	let highlightedBusId: number | null = null;
 	let lastFitLine: string | null = null;
 
 	let debugMessage = $state<string | null>(null);
@@ -143,6 +161,54 @@
 		}
 	}
 
+	function busToProperties(bus: LiveBus) {
+		return {
+			busId: bus.busId,
+			line: bus.line,
+			origin: bus.origin ?? '',
+			destination: bus.destination ?? '',
+			subline: bus.subline ?? '',
+			special: bus.special ?? false,
+			company: bus.company ?? '',
+			speed: bus.speed ?? 0,
+			access: bus.access ?? '',
+			thermalConfort: bus.thermalConfort ?? '',
+			emissions: bus.emissions ?? ''
+		};
+	}
+
+	function propertiesToBus(
+		props: Record<string, unknown>,
+		coordinates: [number, number]
+	): MapBusSelection {
+		return {
+			busId: Number(props.busId),
+			line: String(props.line ?? ''),
+			origin: String(props.origin ?? ''),
+			destination: String(props.destination ?? ''),
+			subline: String(props.subline ?? ''),
+			special: Boolean(props.special),
+			company: String(props.company ?? ''),
+			speed: Number(props.speed ?? 0),
+			access: String(props.access ?? ''),
+			thermalConfort: String(props.thermalConfort ?? ''),
+			emissions: String(props.emissions ?? ''),
+			location: { type: 'Point', coordinates }
+		};
+	}
+
+	function applySelectedBusHighlight() {
+		if (!map || !map.getSource(BUSES_SOURCE_ID)) return;
+
+		if (highlightedBusId !== null) {
+			map.setFeatureState({ source: BUSES_SOURCE_ID, id: highlightedBusId }, { selected: false });
+		}
+		if (selectedBusId !== null) {
+			map.setFeatureState({ source: BUSES_SOURCE_ID, id: selectedBusId }, { selected: true });
+		}
+		highlightedBusId = selectedBusId;
+	}
+
 	function syncBuses(list: LiveBus[]) {
 		if (!map) return;
 		const source = map.getSource(BUSES_SOURCE_ID) as GeoJSONSource | undefined;
@@ -153,10 +219,36 @@
 			features: list.map((bus) => ({
 				type: 'Feature',
 				id: bus.busId,
-				properties: { busId: bus.busId, line: bus.line },
+				properties: busToProperties(bus),
 				geometry: { type: 'Point', coordinates: bus.location.coordinates }
 			}))
 		});
+
+		applySelectedBusHighlight();
+	}
+
+	function upcomingToLiveBus(bus: UpcomingBus): LiveBus {
+		return {
+			busId: bus.busId,
+			line: bus.line,
+			origin: bus.origin,
+			destination: bus.destination,
+			subline: bus.subline,
+			special: bus.special,
+			company: bus.companyName,
+			speed: 0,
+			access: bus.access,
+			thermalConfort: bus.thermalConfort,
+			emissions: bus.emissions,
+			location: bus.location
+		};
+	}
+
+	function handleBusFeatureClick(feature: MapGeoJSONFeature | undefined) {
+		if (!feature?.geometry || feature.geometry.type !== 'Point') return;
+		const bus = propertiesToBus(feature.properties, feature.geometry.coordinates as [number, number]);
+		if (!Number.isFinite(bus.busId)) return;
+		onSelectBus?.(bus);
 	}
 
 	function fitToBuses(list: LiveBus[]) {
@@ -230,7 +322,7 @@
 		if (!mapReady) return;
 
 		if (busMode === 'stop') {
-			syncBuses(buses.map((b) => ({ busId: b.busId, line: b.line, location: b.location })));
+			syncBuses(buses.map(upcomingToLiveBus));
 		} else if (busMode === 'line' && filterLine) {
 			fetchAndSyncBusesByLine(filterLine);
 		} else {
@@ -242,6 +334,11 @@
 	$effect(() => {
 		selectedStopId;
 		applySelectedHighlight();
+	});
+
+	$effect(() => {
+		selectedBusId;
+		applySelectedBusHighlight();
 	});
 
 	$effect(() => {
@@ -308,8 +405,18 @@
 					type: 'circle',
 					source: BUSES_SOURCE_ID,
 					paint: {
-						'circle-radius': 10,
-						'circle-color': '#FFC93C',
+						'circle-radius': [
+							'case',
+							['boolean', ['feature-state', 'selected'], false],
+							14,
+							10
+						],
+						'circle-color': [
+							'case',
+							['boolean', ['feature-state', 'selected'], false],
+							'#5eead4',
+							'#FFC93C'
+						],
 						'circle-stroke-color': '#0B1220',
 						'circle-stroke-width': 2
 					}
@@ -328,6 +435,8 @@
 					paint: { 'text-color': '#0B1220' }
 				});
 
+				const busLayerIds = [BUSES_CIRCLE_LAYER_ID, BUSES_LABEL_LAYER_ID];
+
 				map.on('click', STOPS_LAYER_ID, (e) => {
 					const feature = e.features?.[0] as MapGeoJSONFeature | undefined;
 					const busstopId = feature?.properties?.busstopId;
@@ -335,6 +444,17 @@
 						onSelectStop?.(busstopId);
 					}
 				});
+				for (const layerId of busLayerIds) {
+					map.on('click', layerId, (e) => {
+						handleBusFeatureClick(e.features?.[0] as MapGeoJSONFeature | undefined);
+					});
+					map.on('mouseenter', layerId, () => {
+						if (map) map.getCanvas().style.cursor = 'pointer';
+					});
+					map.on('mouseleave', layerId, () => {
+						if (map) map.getCanvas().style.cursor = '';
+					});
+				}
 				map.on('mouseenter', STOPS_LAYER_ID, () => {
 					if (map) map.getCanvas().style.cursor = 'pointer';
 				});

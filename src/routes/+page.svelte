@@ -1,8 +1,9 @@
 <script lang="ts">
-	import BusMap from '$lib/components/BusMap.svelte';
+	import BusMap, { type MapBusSelection } from '$lib/components/BusMap.svelte';
 	import SearchBar from '$lib/components/SearchBar.svelte';
 	import BottomSheet from '$lib/components/BottomSheet.svelte';
 	import LineEtaCard from '$lib/components/LineEtaCard.svelte';
+	import BusDetailCard from '$lib/components/BusDetailCard.svelte';
 	import { etaToMinutes, type BusStopDetail, type UpcomingBus } from '$lib/types/stm';
 
 	const POLL_INTERVAL_MS = 12_000;
@@ -12,6 +13,8 @@
 	let sheetOpen = $state(false);
 	let sidebarCollapsed = $state(false);
 	let selectedStop = $state<BusStopDetail | null>(null);
+	let selectedBus = $state<MapBusSelection | null>(null);
+	let selectedBusEtaMinutes = $state<number | null>(null);
 	let upcoming = $state<UpcomingBus[]>([]);
 	let loading = $state(false);
 	let loadError = $state('');
@@ -46,6 +49,8 @@
 
 	async function selectStop(busstopId: number) {
 		selectedLine = null;
+		selectedBus = null;
+		selectedBusEtaMinutes = null;
 		loading = true;
 		loadError = '';
 		sheetOpen = true;
@@ -91,8 +96,41 @@
 		selectedLine = null;
 	}
 
+	function selectBusFromMap(bus: MapBusSelection) {
+		selectedBus = bus;
+		const fromUpcoming = upcoming.find((b) => b.busId === bus.busId);
+		selectedBusEtaMinutes = fromUpcoming ? etaToMinutes(fromUpcoming.eta) : null;
+		sheetOpen = true;
+		focusLocation = bus.location.coordinates;
+	}
+
+	function upcomingToMapBus(bus: UpcomingBus): MapBusSelection {
+		return {
+			busId: bus.busId,
+			line: bus.line,
+			origin: bus.origin,
+			destination: bus.destination,
+			subline: bus.subline,
+			special: bus.special,
+			company: bus.companyName,
+			speed: 0,
+			access: bus.access,
+			thermalConfort: bus.thermalConfort,
+			emissions: bus.emissions,
+			location: bus.location
+		};
+	}
+
+	function clearBusSelection() {
+		selectedBus = null;
+		selectedBusEtaMinutes = null;
+		if (!selectedStop) sheetOpen = false;
+	}
+
 	function clearSelection() {
 		selectedStop = null;
+		selectedBus = null;
+		selectedBusEtaMinutes = null;
 		upcoming = [];
 		sheetOpen = false;
 		loadError = '';
@@ -102,6 +140,12 @@
 	// hasta que el usuario toque otra parada en el mapa o busque una.
 	$effect(() => {
 		selectStop(3914);
+	});
+
+	$effect(() => {
+		if (!selectedBus || !selectedStop) return;
+		const match = upcoming.find((b) => b.busId === selectedBus.busId);
+		selectedBusEtaMinutes = match ? etaToMinutes(match.eta) : null;
 	});
 
 	$effect(() => {
@@ -159,8 +203,10 @@
 		buses={upcoming}
 		{focusLocation}
 		selectedStopId={selectedStop?.paradaId ?? null}
+		selectedBusId={selectedBus?.busId ?? null}
 		filterLine={selectedLine}
 		onSelectStop={selectStop}
+		onSelectBus={selectBusFromMap}
 	/>
 
 	<div
@@ -232,6 +278,46 @@
 			<p class="status">Cargando...</p>
 		{:else if loadError}
 			<p class="status error">{loadError}</p>
+		{:else if selectedBus}
+			<div class="panel-header">
+				<h2 class="panel-title">Ómnibus en vivo</h2>
+				<button class="close-btn" onclick={clearBusSelection} aria-label="Cerrar ómnibus">
+					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+						<line x1="18" y1="6" x2="6" y2="18" />
+						<line x1="6" y1="6" x2="18" y2="18" />
+					</svg>
+				</button>
+			</div>
+			<BusDetailCard
+				line={selectedBus.line}
+				destination={selectedBus.destination}
+				origin={selectedBus.origin}
+				company={selectedBus.company}
+				speed={selectedBus.speed}
+				access={selectedBus.access}
+				thermalConfort={selectedBus.thermalConfort}
+				emissions={selectedBus.emissions}
+				etaMinutes={selectedBusEtaMinutes}
+				busId={selectedBus.busId}
+			/>
+			{#if selectedStop}
+				<div class="panel-divider">
+					<span>Parada {selectedStop.calle1} y {selectedStop.calle2}</span>
+				</div>
+				{#if upcoming.length === 0}
+					<p class="status compact">No hay más buses acercándose.</p>
+				{:else}
+					{#each upcoming as bus (bus.busId)}
+						<LineEtaCard
+							line={bus.line}
+							destination={bus.destination}
+							etaMinutes={etaToMinutes(bus.eta)}
+							highlight={bus.busId === selectedBus.busId}
+							onSelect={() => selectBusFromMap(upcomingToMapBus(bus))}
+						/>
+					{/each}
+				{/if}
+			{/if}
 		{:else if selectedStop}
 			<div class="stop-header">
 				<h2 class="stop-name">{selectedStop.calle1} y {selectedStop.calle2}</h2>
@@ -255,6 +341,7 @@
 						line={bus.line}
 						destination={bus.destination}
 						etaMinutes={etaToMinutes(bus.eta)}
+						onSelect={() => selectBusFromMap(upcomingToMapBus(bus))}
 					/>
 				{/each}
 			{/if}
@@ -417,12 +504,42 @@
 		margin: 0;
 	}
 
+	.status.compact {
+		margin: var(--space-2) 0;
+	}
+
 	.stop-header {
 		display: flex;
 		align-items: baseline;
 		justify-content: space-between;
 		gap: var(--space-2);
-		margin-bottom: var(--space-2);
+		margin-bottom: var(--space-3);
+	}
+
+	.panel-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-2);
+		margin-bottom: var(--space-3);
+	}
+
+	.panel-title {
+		font-size: 13px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--color-text-secondary);
+		margin: 0;
+	}
+
+	.panel-divider {
+		margin: var(--space-5) 0 var(--space-3);
+		padding-top: var(--space-4);
+		border-top: 1px solid var(--color-border);
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--color-text-secondary);
 	}
 
 	.stop-name {
