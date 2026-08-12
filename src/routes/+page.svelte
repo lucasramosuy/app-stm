@@ -7,7 +7,10 @@
 	import BusDetailCard from '$lib/components/BusDetailCard.svelte';
 	import EmptyStateCard from '$lib/components/EmptyStateCard.svelte';
 	import WelcomeModal from '$lib/components/WelcomeModal.svelte';
+	import TripPlannerBar from '$lib/components/TripPlannerBar.svelte';
+	import TripResultsCard from '$lib/components/TripResultsCard.svelte';
 	import { etaToMinutes, type BusStopDetail, type UpcomingBus } from '$lib/types/stm';
+	import type { TripOption } from '$lib/types/trip';
 
 	const POLL_INTERVAL_MS = 20_000;
 	const SEARCH_DEBOUNCE_MS = 300;
@@ -25,9 +28,6 @@
 
 	type FavoriteItem = RecentItem;
 
-	/** Estado de una parada dentro de la selección múltiple: cada una
-	 * mantiene su propio ciclo de carga/error/polling, independiente de
-	 * las demás. */
 	interface StopSelectionState {
 		busstopId: number;
 		detail: BusStopDetail | null;
@@ -36,20 +36,19 @@
 		error: string;
 		stale: boolean;
 		lastUpdatedAt: number | null;
-		/** true solo si esta parada se agregó sola al entrar (fallback a
-		 * favoritos en onMount), no porque el usuario la haya tocado —
-		 * controla el kicker "Tu parada favorita". */
 		isDefault: boolean;
+	}
+
+	interface TripPoint {
+		label: string;
+		coordinates: [number, number];
+		type: 'gps' | 'point';
 	}
 
 	let query = $state('');
 	let sheetOpen = $state(false);
 	let sidebarCollapsed = $state(false);
 
-	// Selección múltiple: cada tap sobre una parada o un ómnibus SUMA a
-	// estas listas (no reemplaza). Si ya está seleccionada, tocarla de
-	// nuevo no hace nada — el único modo de sacarla es su botón de
-	// cerrar, o "Limpiar todo".
 	let selectedStops = $state<StopSelectionState[]>([]);
 	let selectedBuses = $state<MapBusSelection[]>([]);
 
@@ -57,11 +56,18 @@
 	let selectedLine = $state<string | null>(null);
 	let recentItems = $state<RecentItem[]>([]);
 	let favoriteItems = $state<FavoriteItem[]>([]);
-	// Kicker de LÍNEA favorita únicamente — independiente del flag
-	// `isDefault` que ahora vive por-parada dentro de StopSelectionState.
 	let isDefaultFavorite = $state(false);
 	let nowTick = $state(Date.now());
 	let showWelcome = $state(false);
+
+	// "Cómo llegar" — independiente de la pila de selección múltiple.
+	let tripDestination = $state<TripPoint | null>(null);
+	let tripOrigin = $state<TripPoint | null>(null);
+	let locatingOrigin = $state(false);
+	let originError = $state<string | null>(null);
+	let tripOptions = $state<TripOption[] | null>(null);
+	let tripLoading = $state(false);
+	let tripSearchError = $state<string | null>(null);
 
 	interface SearchStopResult {
 		busstopId: number;
@@ -89,14 +95,7 @@
 		} else {
 			url.searchParams.delete('line');
 		}
-		// La selección múltiple de paradas no se sincroniza a la URL en
-		// esta versión — un solo "?stop=" no alcanza para representar
-		// varias a la vez. Se podría extender a "?stops=1,2,3" más
-		// adelante si hace falta compartir un link con varias paradas.
 		url.searchParams.delete('stop');
-		// Nativo a propósito, no replaceState de $app/navigation: puede
-		// llamarse muy temprano (fallback de favoritos en onMount) antes
-		// de que el router de SvelteKit esté inicializado.
 		window.history.replaceState({}, '', url.toString());
 	}
 
@@ -164,29 +163,15 @@
 		return { data, stale };
 	}
 
-	/** Muta el item EN EL LUGAR (no reasigna `selectedStops` entero) para
-	 * que el $effect de polling —que solo depende de la CANTIDAD de
-	 * paradas seleccionadas— no se reinicie en cada respuesta de red. Si
-	 * reasignáramos el array acá, el intervalo se cortaría y volvería a
-	 * arrancar en cada poll, sin llegar nunca a dispararse de verdad. */
 	function patchStop(busstopId: number, patch: Partial<StopSelectionState>) {
 		const stop = selectedStops.find((s) => s.busstopId === busstopId);
 		if (!stop) return;
 		Object.assign(stop, patch);
 	}
 
-	/**
-	 * Suma una parada a la selección. Si ya está seleccionada, no hace
-	 * nada (sin duplicados en la pila).
-	 * @param isDefault true solo cuando se carga sola al entrar (fallback
-	 * a favoritos en onMount) — controla el kicker "Tu parada favorita".
-	 */
 	async function addStop(busstopId: number, isDefault = false) {
 		if (selectedStops.some((s) => s.busstopId === busstopId)) return;
 
-		// Mismo criterio que la versión anterior: elegir una parada
-		// limpia el filtro de línea activo (son dos conceptos distintos
-		// — colección de paradas/buses vs. filtro de línea en el mapa).
 		selectedLine = null;
 		isDefaultFavorite = false;
 
@@ -281,9 +266,6 @@
 		};
 	}
 
-	/** Busca el ETA de un bus entre los upcoming de TODAS las paradas
-	 * seleccionadas (puede aparecer en más de una si comparten línea) —
-	 * usa el primer match que encuentra. */
 	function findBusEta(busId: number): number | null {
 		for (const stop of selectedStops) {
 			const match = stop.upcoming.find((b) => b.busId === busId);
@@ -304,9 +286,6 @@
 		addStop(stop.busstopId);
 	}
 
-	/**
-	 * @param isDefault ver comentario de addStop() arriba.
-	 */
 	function pickLineResult(line: string, isDefault = false) {
 		searchOpen = false;
 		query = line;
@@ -327,9 +306,104 @@
 		updateUrl(null);
 	}
 
-	// Deep links al montar la página, y si no hay ninguno, fallback al
-	// primer favorito guardado. isDefault=true solo prende el kicker
-	// visual, no cambia el resto del comportamiento.
+	// --- "Cómo llegar" ---
+
+	function setTripDestination(label: string, coordinates: [number, number]) {
+		tripDestination = { label, coordinates, type: 'point' };
+		tripOptions = null;
+		tripSearchError = null;
+	}
+
+	function clearTripDestination() {
+		tripDestination = null;
+		tripOrigin = null;
+		originError = null;
+		tripOptions = null;
+		tripSearchError = null;
+	}
+
+	function clearTripOrigin() {
+		tripOrigin = null;
+		originError = null;
+		tripOptions = null;
+		tripSearchError = null;
+	}
+
+	function swapTrip() {
+		if (!tripOrigin || !tripDestination) return;
+		const newDestination = { ...tripOrigin, type: 'point' as const };
+		const newOrigin = { ...tripDestination, type: 'point' as const };
+		tripDestination = newDestination;
+		tripOrigin = newOrigin;
+		tripOptions = null;
+		tripSearchError = null;
+	}
+
+	function useMyLocationAsOrigin() {
+		if (!('geolocation' in navigator)) {
+			originError = 'Este navegador no soporta geolocalización.';
+			return;
+		}
+		locatingOrigin = true;
+		originError = null;
+		navigator.geolocation.getCurrentPosition(
+			(pos) => {
+				tripOrigin = {
+					label: 'Mi ubicación',
+					coordinates: [pos.coords.longitude, pos.coords.latitude],
+					type: 'gps'
+				};
+				locatingOrigin = false;
+			},
+			() => {
+				locatingOrigin = false;
+				originError = 'No se pudo obtener tu ubicación.';
+			},
+			{ enableHighAccuracy: true, timeout: 12_000, maximumAge: 30_000 }
+		);
+	}
+
+	/** Tap directo sobre un ícono del mapa base: marca ese punto como
+	 * destino y usa el GPS como origen automáticamente — acción rápida
+	 * "ir hasta acá". El origen se puede editar después con los
+	 * controles normales del panel. */
+	function selectPoiAsDestination(poi: { label: string; coordinates: [number, number] }) {
+		setTripDestination(poi.label, poi.coordinates);
+		useMyLocationAsOrigin();
+	}
+
+	async function searchRoute() {
+		if (!tripOrigin || !tripDestination) return;
+		tripLoading = true;
+		tripSearchError = null;
+		tripOptions = null;
+		sheetOpen = true;
+
+		const params = new URLSearchParams({
+			originLat: String(tripOrigin.coordinates[1]),
+			originLng: String(tripOrigin.coordinates[0]),
+			destLat: String(tripDestination.coordinates[1]),
+			destLng: String(tripDestination.coordinates[0])
+		});
+
+		try {
+			const res = await fetch(`/api/trip-plan?${params}`);
+			if (!res.ok) throw new Error('No se pudo calcular la ruta');
+			const data: { options: TripOption[] } = await res.json();
+			tripOptions = data.options;
+		} catch (err) {
+			tripSearchError = err instanceof Error ? err.message : 'Error desconocido';
+		} finally {
+			tripLoading = false;
+		}
+	}
+
+	function closeTripResults() {
+		tripOptions = null;
+		tripSearchError = null;
+		if (selectedStops.length === 0 && selectedBuses.length === 0) sheetOpen = false;
+	}
+
 	onMount(() => {
 		loadRecents();
 		loadFavorites();
@@ -348,9 +422,6 @@
 		}
 
 		if (stopParam) {
-			// Compatibilidad con links viejos (?stop=...) — ya no se
-			// vuelven a generar desde updateUrl(), pero si alguien tiene
-			// uno guardado, lo seguimos respetando.
 			const id = Number(stopParam);
 			if (!Number.isNaN(id)) addStop(id);
 		} else if (lineParam) {
@@ -374,12 +445,6 @@
 		}
 	}
 
-	// Polling unificado: todas las paradas seleccionadas se refrescan en
-	// simultáneo cada 20s, pausado en background. El efecto depende
-	// solo de la CANTIDAD de paradas — arranca/reinicia el intervalo al
-	// agregar o quitar una, pero NO en cada respuesta de red individual,
-	// porque esas se aplican con patchStop() (mutación in-place, sin
-	// reasignar el array top-level).
 	$effect(() => {
 		const count = selectedStops.length;
 		if (count === 0) return;
@@ -434,9 +499,6 @@
 	const selectedBusIds = $derived(selectedBuses.map((b) => b.busId));
 	const totalSelectedCount = $derived(selectedStops.length + selectedBuses.length);
 
-	// Aproximación para el anuncio de accesibilidad de BusMap (aria-live
-	// de una sola parada): usa la última agregada, ya que esa prop fue
-	// pensada para el caso singular original.
 	const selectedStopNameStr = $derived(
 		selectedStops[0]?.detail
 			? `${selectedStops[0].detail.calle1} y ${selectedStops[0].detail.calle2}`
@@ -458,6 +520,7 @@
 		filterLine={selectedLine}
 		onSelectStop={addStop}
 		onSelectBus={addBus}
+		onSelectPoi={selectPoiAsDestination}
 	/>
 
 	<div
@@ -481,6 +544,20 @@
 
 		<div class="search-col">
 			<SearchBar bind:value={query} />
+
+			{#if tripDestination}
+				<TripPlannerBar
+					destination={tripDestination}
+					origin={tripOrigin}
+					{locatingOrigin}
+					{originError}
+					onUseMyLocation={useMyLocationAsOrigin}
+					onClearOrigin={clearTripOrigin}
+					onClearDestination={clearTripDestination}
+					onSwap={swapTrip}
+					onSearchRoute={searchRoute}
+				/>
+			{/if}
 
 			{#if selectedLine}
 				<div class="active-filter">
@@ -529,9 +606,24 @@
 					{#if searchResults.stops.length > 0}
 						<div class="search-section-label">Paradas</div>
 						{#each searchResults.stops as stop (stop.busstopId)}
-							<button class="search-result" onclick={() => pickStopResult(stop)}>
-								{stop.street1} y {stop.street2}
-							</button>
+							<div class="search-result-row">
+								<button class="search-result" onclick={() => pickStopResult(stop)}>
+									{stop.street1} y {stop.street2}
+								</button>
+								<button
+									class="directions-btn"
+									onclick={() => {
+										setTripDestination(`${stop.street1} y ${stop.street2}`, stop.location.coordinates);
+										searchOpen = false;
+									}}
+									aria-label="Cómo llegar hasta acá"
+									title="Cómo llegar hasta acá"
+								>
+									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+										<polygon points="3 11 22 2 13 21 11 13 3 11" />
+									</svg>
+								</button>
+							</div>
 						{/each}
 					{/if}
 				</div>
@@ -544,7 +636,14 @@
 	</div>
 
 	<BottomSheet open={sheetOpen} bind:collapsed={sidebarCollapsed}>
-		{#if totalSelectedCount > 0}
+		{#if tripLoading || tripSearchError || tripOptions !== null}
+			<TripResultsCard
+				loading={tripLoading}
+				error={tripSearchError}
+				options={tripOptions ?? []}
+				onClose={closeTripResults}
+			/>
+		{:else if totalSelectedCount > 0}
 			<div class="selection-stack">
 				{#if totalSelectedCount > 1}
 					<div class="stack-toolbar">
@@ -576,6 +675,16 @@
 								</button>
 								<h2 class="panel-title">Ómnibus en vivo</h2>
 							</div>
+							<button
+								class="directions-btn"
+								onclick={() => setTripDestination(`Línea ${bus.line} — ${bus.destination}`, bus.location.coordinates)}
+								aria-label="Cómo llegar hasta este ómnibus"
+								title="Cómo llegar hasta acá"
+							>
+								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+									<polygon points="3 11 22 2 13 21 11 13 3 11" />
+								</svg>
+							</button>
 							<button class="close-btn" onclick={() => removeBus(bus.busId)} aria-label="Cerrar ómnibus">
 								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
 									<line x1="18" y1="6" x2="6" y2="18" />
@@ -637,6 +746,16 @@
 											{stop.stale ? 'Datos demorados · ' : ''}hace {Math.max(0, Math.round((nowTick - stop.lastUpdatedAt) / 1000))}s
 										</span>
 									{/if}
+									<button
+										class="directions-btn"
+										onclick={() => setTripDestination(`${stop.detail!.calle1} y ${stop.detail!.calle2}`, stop.detail!.location.coordinates)}
+										aria-label="Cómo llegar hasta esta parada"
+										title="Cómo llegar hasta acá"
+									>
+										<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+											<polygon points="3 11 22 2 13 21 11 13 3 11" />
+										</svg>
+									</button>
 									<button class="close-btn" onclick={() => removeStop(stop.busstopId)} aria-label="Cerrar parada">
 										<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
 											<line x1="18" y1="6" x2="6" y2="18" />
@@ -839,6 +958,37 @@
 
 	.fav-star-btn.active {
 		color: var(--color-accent);
+	}
+
+	.directions-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		width: 24px;
+		height: 24px;
+		background: none;
+		border: none;
+		color: var(--color-text-secondary);
+		cursor: pointer;
+		border-radius: var(--radius-sm);
+		transition: color 0.15s ease;
+	}
+
+	.directions-btn:hover {
+		color: var(--color-live);
+		background: rgba(94, 234, 212, 0.1);
+	}
+
+	.search-result-row {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+	}
+
+	.search-result-row .search-result {
+		flex: 1;
+		min-width: 0;
 	}
 
 	.stop-header-title,

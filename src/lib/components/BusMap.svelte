@@ -63,7 +63,9 @@
 		selectedBusIds = [],
 		filterLine = null,
 		onSelectStop,
-		onSelectBus
+		onSelectBus,
+		onSelectPoi
+
 	}: {
 		buses?: UpcomingBus[];
 		focusLocation?: [number, number] | null;
@@ -73,6 +75,7 @@
 		filterLine?: string | null;
 		onSelectStop?: (busstopId: number) => void;
 		onSelectBus?: (bus: MapBusSelection) => void;
+		onSelectPoi?: (poi: { label: string; coordinates: [number, number] }) => void;
 	} = $props();
 
 	// Modo de qué buses mostrar en el mapa:
@@ -107,6 +110,15 @@
 	const SHAPE_SOURCE_ID = 'route-shape';
 	const SHAPE_GLOW_LAYER_ID = 'route-shape-glow';
 	const SHAPE_LINE_LAYER_ID = 'route-shape-line';
+
+	// Capas de POI del estilo base Liberty (OpenFreeMap) — no son
+	// nuestras, ya vienen en el JSON del estilo. Confirmadas fetcheando
+	// STYLE_URL directo: poi_r1/r7/r20 son comercios y amenities
+	// genéricos (por rango de importancia), poi_transit cubre íconos de
+	// aeropuerto/bus/tren, airport es el ícono+label de aeródromos. Se
+	// engancha el click igual que en las capas propias, solo que estas
+	// ya existen en el estilo sin que nosotros las agreguemos.
+	const BASE_POI_LAYER_IDS = ['poi_r1', 'poi_r7', 'poi_r20', 'poi_transit', 'airport'];
 
 	// Violeta a propósito: las calles del estilo oscuro van de ocre
 	// (#e0a458, avenidas) a gris azulado (#3d4863/#8f97a8, calles menores).
@@ -369,6 +381,15 @@
 		return meters / metersPerPixel;
 	}
 
+	/** El estilo arma el label visible con una expresión (coalesce +
+	 * concat de name:nonlatin) que no podemos leer desde acá — feature.
+	 * properties trae los campos crudos del vector tile. Este fallback
+	 * cubre el caso común (sin nombre no-latino, que es lo esperable
+	 * para Montevideo). */
+	function getPoiName(props: Record<string, unknown>): string {
+		return String(props.name_en ?? props.name ?? props['name:latin'] ?? 'Punto en el mapa');
+	}
+
 	function updateUserLocationLayer() {
 		if (!map || !lastUserCoords) return;
 		const source = map.getSource(USER_LOCATION_SOURCE_ID) as GeoJSONSource | undefined;
@@ -629,6 +650,24 @@
 						'circle-stroke-width': ['case', ['boolean', ['feature-state', 'selected'], false], 3, 2]
 					}
 				});
+				// Tap sobre cualquier ícono del mapa base (comercios, parques,
+				// terminales, etc.) — no son capas nuestras, así que no hay
+				// addLayer acá, solo nos enganchamos a las que ya trae el estilo.
+				for (const layerId of BASE_POI_LAYER_IDS) {
+					map.on('click', layerId, (e) => {
+						const feature = e.features?.[0] as MapGeoJSONFeature | undefined;
+						if (!feature || feature.geometry.type !== 'Point') return;
+						const coordinates = (feature.geometry as { coordinates: [number, number] }).coordinates;
+						const label = getPoiName(feature.properties as Record<string, unknown>);
+						onSelectPoi?.({ label, coordinates });
+					});
+					map.on('mouseenter', layerId, () => {
+						if (map) map.getCanvas().style.cursor = 'pointer';
+					});
+					map.on('mouseleave', layerId, () => {
+						if (map) map.getCanvas().style.cursor = '';
+					});
+				}
 				map.addLayer({
 					id: BUSES_LABEL_LAYER_ID,
 					type: 'symbol',
