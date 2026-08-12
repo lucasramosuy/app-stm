@@ -5,6 +5,7 @@
 	import BottomSheet from '$lib/components/BottomSheet.svelte';
 	import LineEtaCard from '$lib/components/LineEtaCard.svelte';
 	import BusDetailCard from '$lib/components/BusDetailCard.svelte';
+	import EmptyStateCard from '$lib/components/EmptyStateCard.svelte';
 	import { etaToMinutes, type BusStopDetail, type UpcomingBus } from '$lib/types/stm';
 
 	const POLL_INTERVAL_MS = 20_000;
@@ -400,50 +401,6 @@
 		<div class="search-col">
 			<SearchBar bind:value={query} />
 
-			<!-- Recientes / Favoritos rápidos cuando no hay búsqueda activa -->
-			{#if query.trim().length === 0 && (favoriteItems.length > 0 || recentItems.length > 0) && !selectedLine}
-				<div class="quick-access-list">
-					{#if favoriteItems.length > 0}
-						<div class="recents-row favorites-row">
-							<span class="recents-label favorites-label">
-								<svg width="12" height="12" viewBox="0 0 24 24" fill="var(--color-accent)" stroke="var(--color-accent)" stroke-width="2">
-									<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
-								</svg>
-								Favoritos:
-							</span>
-							{#each favoriteItems as item (item.id)}
-								<button
-									class="recent-chip favorite-chip"
-									onclick={() => {
-										if (item.type === 'stop' && item.busstopId) selectStop(item.busstopId);
-										else if (item.type === 'line' && item.line) pickLineResult(item.line);
-									}}
-								>
-									{item.title}
-								</button>
-							{/each}
-						</div>
-					{/if}
-
-					{#if recentItems.filter((r) => !isFavorite(r.id)).length > 0}
-						<div class="recents-row">
-							<span class="recents-label">Recientes:</span>
-							{#each recentItems.filter((r) => !isFavorite(r.id)) as item (item.id)}
-								<button
-									class="recent-chip"
-									onclick={() => {
-										if (item.type === 'stop' && item.busstopId) selectStop(item.busstopId);
-										else if (item.type === 'line' && item.line) pickLineResult(item.line);
-									}}
-								>
-									{item.title}
-								</button>
-							{/each}
-						</div>
-					{/if}
-				</div>
-			{/if}
-
 			{#if selectedLine}
 				<div class="active-filter">
 					<span class="line-chip small">{selectedLine}</span>
@@ -640,7 +597,14 @@
 				</div>
 			</div>
 		{:else}
-			<p class="status">Tocá una parada u ómnibus en el mapa, o buscá una línea o dirección.</p>
+			<EmptyStateCard
+				favorites={favoriteItems}
+				recents={recentItems}
+				onPick={(item) => {
+					if (item.type === 'stop' && item.busstopId) selectStop(item.busstopId);
+					else if (item.type === 'line' && item.line) pickLineResult(item.line);
+				}}
+			/>
 		{/if}
 	</BottomSheet>
 </main>
@@ -672,45 +636,6 @@
 	.search-col {
 		flex: 1;
 		min-width: 0;
-	}
-
-	.recents-row {
-		display: flex;
-		align-items: center;
-		gap: var(--space-2);
-		margin-top: var(--space-2);
-		overflow-x: auto;
-		padding-bottom: 2px;
-		scrollbar-width: none;
-		-ms-overflow-style: none;
-	}
-
-	.recents-row::-webkit-scrollbar {
-		display: none;
-	}
-
-	.recents-label {
-		font-size: 11px;
-		color: var(--color-text-secondary);
-		white-space: nowrap;
-		flex-shrink: 0;
-	}
-
-	.recent-chip {
-		background: rgba(19, 27, 46, 0.85);
-		border: 1px solid var(--color-border);
-		border-radius: var(--radius-sm);
-		color: var(--color-text);
-		font-size: 11px;
-		padding: 3px 8px;
-		white-space: nowrap;
-		cursor: pointer;
-		transition: background 0.15s ease;
-		flex-shrink: 0;
-	}
-
-	.recent-chip:hover {
-		background: rgba(255, 255, 255, 0.12);
 	}
 
 	@media (min-width: 900px) {
@@ -832,30 +757,6 @@
 
 	.fav-star-btn.active {
 		color: var(--color-accent);
-	}
-
-	.quick-access-list {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-	}
-
-	.favorites-label {
-		color: var(--color-accent);
-		display: flex;
-		align-items: center;
-		gap: 4px;
-		font-weight: 600;
-	}
-
-	.favorite-chip {
-		border-color: rgba(255, 201, 60, 0.3);
-		background: rgba(255, 201, 60, 0.08);
-	}
-
-	.favorite-chip:hover {
-		background: rgba(255, 201, 60, 0.18);
-		border-color: var(--color-accent);
 	}
 
 	.stop-header-title,

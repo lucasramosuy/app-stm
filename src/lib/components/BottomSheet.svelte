@@ -27,8 +27,11 @@
 	// umbral. El onclick posterior lo consulta y se auto-descarta una vez
 	// usado, para no interferir con un tap genuino inmediatamente después.
 	let wasDragged = false;
-	/** En móvil: expandido (0) o peek (solo asa). */
-	let mobileExpanded = $state(true);
+	/** En móvil: expandido (0) o peek (solo asa). Arranca en peek: sin
+	 * selección todavía no hay motivo para ocupar la pantalla. Se
+	 * expande solo automáticamente cuando llega una selección nueva (ver
+	 * el $effect de abajo), o manualmente si el usuario arrastra. */
+	let mobileExpanded = $state(false);
 	$effect(() => {
 		if (open) mobileExpanded = true;
 	});
@@ -55,15 +58,60 @@
 	function clampOffset(y: number) {
 		return Math.max(0, Math.min(peekOffset(), y));
 	}
+
+	// mobileExpanded es la ÚNICA fuente de verdad de la posición en
+	// reposo. `open` NO debe forzar el offset acá — si lo hace, cualquier
+	// drag manual del usuario queda pisado apenas suelta el dedo, porque
+	// open sigue en false mientras no haya selección (ver bug: el sheet
+	// "volvía abajo solo" al soltar, sin importar cuánto se hubiera
+	// arrastrado). El único lugar donde `open` debe influir es el
+	// $effect de abajo, que dispara la expansión automática al aparecer
+	// una selección nueva.
+	function visualOffset(): number {
+		return mobileExpanded ? 0 : peekOffset();
+	}
+
+	// Única fuente deverdad para lo que se pinta en pantalla en mobile:
+	// se calcula acá (no en un `style:transform={...}` declarativo) porque
+	// necesitamos poder escribirlo de forma síncrona en pointerdown, ANTES
+	// de que llegue el primer pointermove — si no, hay un instante sin
+	// transform aplicado donde el sheet "salta" a su posición natural
+	// (totalmente expandida, por el position:absolute + bottom:0).
+	function currentMobileTransform(): string {
+		if (dragging) return `translateY(${dragOffset}px)`;
+		return `translateY(${visualOffset()}px)`;
+	}
+
+	function applyMobileTransform() {
+		if (!sheetEl || isDesktop) return;
+		sheetEl.style.transform = currentMobileTransform();
+	}
+
+	// Reescribe el transform imperativamente cada vez que cambia algo que
+	// lo afecta en reposo (abrir/cerrar, expandir/colapsar, pasar a
+	// desktop). Durante el drag, quien escribe es onPointerMove
+	// directamente — este effect solo corre por los cambios de estado
+	// "de reposo", no en cada frame de arrastre.
+	$effect(() => {
+		open;
+		mobileExpanded;
+		isDesktop;
+		applyMobileTransform();
+	});
+
 	function onPointerDown(e: PointerEvent) {
 		if (isDesktop) return;
 		const target = e.target as HTMLElement;
 		if (!target.closest('.drag-zone')) return;
 		pointerId = e.pointerId;
-		dragging = true;
 		dragStartY = e.clientY;
-		dragStartOffset = mobileExpanded ? 0 : peekOffset();
+		dragStartOffset = visualOffset();
 		dragOffset = dragStartOffset;
+		dragging = true;
+		// Escribe el transform ACÁ, de forma síncrona, antes de que pase
+		// nada más — así nunca hay un frame sin transform aplicado entre
+		// tocar la pantalla y el primer pointermove real.
+		applyMobileTransform();
 		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 		window.addEventListener('pointermove', onWindowPointerMove);
 		window.addEventListener('pointerup', onWindowPointerUp);
@@ -96,17 +144,16 @@
 		const threshold = peekOffset() * 0.45;
 		mobileExpanded = dragOffset < threshold;
 		dragOffset = 0;
+		// El $effect de arriba también va a correr por el cambio de
+		// mobileExpanded, pero lo llamamos ya acá para que la transición
+		// CSS (restaurada al sacar la clase .dragging) arranque en el
+		// mismo frame del release, sin esperar el flush de Svelte.
+		applyMobileTransform();
 	}
 	function toggleMobileExpand() {
 		if (isDesktop) return;
 		mobileExpanded = !mobileExpanded;
 	}
-	const mobileTransform = $derived.by(() => {
-		if (isDesktop) return '';
-		if (dragging) return `translateY(${dragOffset}px)`;
-		if (!open) return `translateY(calc(100% - ${PEEK_HEIGHT}px))`;
-		return mobileExpanded ? 'translateY(0)' : `translateY(calc(100% - ${PEEK_HEIGHT}px))`;
-	});
 </script>
 
 <svelte:window onresize={measureSheet} />
@@ -118,7 +165,6 @@
 	class:collapsed
 	class:dragging
 	bind:this={sheetEl}
-	style:transform={!isDesktop && !dragging ? mobileTransform : undefined}
 >
 	<button
 		type="button"
