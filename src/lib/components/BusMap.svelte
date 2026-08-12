@@ -58,18 +58,18 @@
 	let {
 		buses = [],
 		focusLocation = null,
-		selectedStopId = null,
+		selectedStopIds = [],
 		selectedStopName = null,
-		selectedBusId = null,
+		selectedBusIds = [],
 		filterLine = null,
 		onSelectStop,
 		onSelectBus
 	}: {
 		buses?: UpcomingBus[];
 		focusLocation?: [number, number] | null;
-		selectedStopId?: number | null;
+		selectedStopIds?: number[];
 		selectedStopName?: string | null;
-		selectedBusId?: number | null;
+		selectedBusIds?: number[];
 		filterLine?: string | null;
 		onSelectStop?: (busstopId: number) => void;
 		onSelectBus?: (bus: MapBusSelection) => void;
@@ -82,7 +82,7 @@
 	//   (mismos datos que ya vienen en el sidebar, sin fetch propio).
 	// - "viewport": caso default → todos los buses visibles en el área
 	//   actual del mapa.
-	const busMode = $derived(filterLine ? 'line' : selectedStopId !== null ? 'stop' : 'viewport');
+	const busMode = $derived(filterLine ? 'line' : selectedStopIds.length > 0 ? 'stop' : 'viewport');
 
 	// Por debajo de este zoom no mostramos paradas: a nivel ciudad serían
 	// miles de puntos amontonados sin valor y con costo de red innecesario.
@@ -120,8 +120,12 @@
 	let map: MapLibreMap | undefined;
 	let mapReady = $state(false);
 
-	let highlightedStopId: number | null = null;
-	let highlightedBusId: number | null = null;
+	// Sets, no un solo id: con selección múltiple hay que poder prender y
+	// apagar el feature-state de varias paradas/buses a la vez, y apagar
+	// los que quedaron marcados antes pero ya no forman parte de la
+	// selección actual.
+	let highlightedStopIds = new Set<number>();
+	let highlightedBusIds = new Set<number>();
 	let lastFitLine: string | null = null;
 	let lastShapeLine: string | null = null;
 
@@ -150,25 +154,31 @@
 	function applySelectedHighlight() {
 		if (!map || !map.getSource(STOPS_SOURCE_ID)) return;
 
-		if (highlightedStopId !== null) {
-			map.setFeatureState({ source: STOPS_SOURCE_ID, id: highlightedStopId }, { selected: false });
+		const nextIds = new Set(selectedStopIds);
+		for (const id of highlightedStopIds) {
+			if (!nextIds.has(id)) {
+				map.setFeatureState({ source: STOPS_SOURCE_ID, id }, { selected: false });
+			}
 		}
-		if (selectedStopId !== null) {
-			map.setFeatureState({ source: STOPS_SOURCE_ID, id: selectedStopId }, { selected: true });
+		for (const id of nextIds) {
+			map.setFeatureState({ source: STOPS_SOURCE_ID, id }, { selected: true });
 		}
-		highlightedStopId = selectedStopId;
+		highlightedStopIds = nextIds;
 	}
 
 	function applySelectedBusHighlight() {
 		if (!map || !map.getSource(BUSES_SOURCE_ID)) return;
 
-		if (highlightedBusId !== null) {
-			map.setFeatureState({ source: BUSES_SOURCE_ID, id: highlightedBusId }, { selected: false });
+		const nextIds = new Set(selectedBusIds);
+		for (const id of highlightedBusIds) {
+			if (!nextIds.has(id)) {
+				map.setFeatureState({ source: BUSES_SOURCE_ID, id }, { selected: false });
+			}
 		}
-		if (selectedBusId !== null) {
-			map.setFeatureState({ source: BUSES_SOURCE_ID, id: selectedBusId }, { selected: true });
+		for (const id of nextIds) {
+			map.setFeatureState({ source: BUSES_SOURCE_ID, id }, { selected: true });
 		}
-		highlightedBusId = selectedBusId;
+		highlightedBusIds = nextIds;
 	}
 
 	function syncStopMarkers(list: NearbyStop[]) {
@@ -501,12 +511,12 @@
 	});
 
 	$effect(() => {
-		selectedStopId;
+		selectedStopIds;
 		applySelectedHighlight();
 	});
 
 	$effect(() => {
-		selectedBusId;
+		selectedBusIds;
 		applySelectedBusHighlight();
 	});
 
