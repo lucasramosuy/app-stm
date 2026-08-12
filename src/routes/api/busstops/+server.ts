@@ -1,10 +1,13 @@
-import { json } from '@sveltejs/kit';
-import { stmFetch } from '$lib/server/stmApi';
+import { getBusStops } from '$lib/server/stmCache';
+import { jsonFromStmCache, handleStmError } from '$lib/server/stmHttp';
 import type { RequestHandler } from './$types';
 
+
 export const GET: RequestHandler = async () => {
-	const data = await stmFetch('/buses/busstops');
-	return json(data, {
-		headers: { 'Cache-Control': 'public, max-age=3600' }
-	});
+		try {
+		const result = await getBusStops();
+		return jsonFromStmCache(result, 'public, max-age=3600');
+	} catch (err) {
+		return handleStmError(err);
+	}
 };

@@ -3,16 +3,30 @@
 		line,
 		destination,
 		etaMinutes,
-		live = true
+		live = true,
+		highlight = false,
+		onSelect
 	}: {
 		line: string;
 		destination: string;
 		etaMinutes: number;
 		live?: boolean;
+		highlight?: boolean;
+		onSelect?: () => void;
 	} = $props();
 </script>
 
-<div class="card">
+{#if onSelect}
+	<button type="button" class="card clickable" class:highlight onclick={onSelect}>
+		{@render inner()}
+	</button>
+{:else}
+	<div class="card" class:highlight>
+		{@render inner()}
+	</div>
+{/if}
+
+{#snippet inner()}
 	<div class="line-badge">{line}</div>
 	<div class="info">
 		<span class="destination">→ {destination}</span>
@@ -23,19 +37,40 @@
 			<span class="tabular-nums">{etaMinutes} min</span>
 		</span>
 	</div>
-</div>
+{/snippet}
 
 <style>
 	.card {
 		display: flex;
 		align-items: center;
-		gap: var(--space-4);
-		padding: var(--space-3) 0;
-		border-bottom: 1px solid var(--color-border);
+		gap: var(--space-3);
+		width: 100%;
+		padding: var(--space-3);
+		margin-bottom: var(--space-2);
+		background: var(--color-surface-raised);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		text-align: left;
+		font-family: inherit;
+		color: inherit;
+		transition:
+			border-color 0.15s ease,
+			background 0.15s ease;
 	}
 
-	.card:last-child {
-		border-bottom: none;
+	.card.clickable {
+		cursor: pointer;
+	}
+
+	.card.clickable:hover,
+	.card.clickable:focus-visible {
+		background: rgba(245, 246, 248, 0.05);
+		border-color: rgba(255, 201, 60, 0.35);
+	}
+
+	.card.highlight {
+		border-color: rgba(94, 234, 212, 0.45);
+		background: rgba(94, 234, 212, 0.06);
 	}
 
 	.line-badge {
@@ -48,8 +83,8 @@
 		justify-content: center;
 		background: var(--color-accent);
 		color: var(--color-bg);
-		font-weight: 700;
-		font-size: 16px;
+		font-weight: 800;
+		font-size: 15px;
 		border-radius: var(--radius-sm);
 	}
 

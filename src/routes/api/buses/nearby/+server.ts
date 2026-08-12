@@ -1,5 +1,6 @@
-import { json, error } from '@sveltejs/kit';
+import { error, json } from '@sveltejs/kit';
 import { getAllBuses } from '$lib/server/stmCache';
+import { stmResultHeaders, handleStmError } from '$lib/server/stmHttp';
 import type { RequestHandler } from './$types';
 
 const MAX_RESULTS = 400;
@@ -14,18 +15,21 @@ export const GET: RequestHandler = async ({ url }) => {
 		throw error(400, 'Faltan o son inválidos los parámetros minLat/minLng/maxLat/maxLng');
 	}
 
-	const allBuses = await getAllBuses();
-
-	const results = [];
-	for (const bus of allBuses) {
-		const [lng, lat] = bus.location.coordinates;
-		if (lat >= minLat && lat <= maxLat && lng >= minLng && lng <= maxLng) {
-			results.push(bus);
-			if (results.length >= MAX_RESULTS) break;
+	try {
+		const result = await getAllBuses();
+		const results = [];
+		for (const bus of result.data) {
+			const [lng, lat] = bus.location.coordinates;
+			if (lat >= minLat && lat <= maxLat && lng >= minLng && lng <= maxLng) {
+				results.push(bus);
+				if (results.length >= MAX_RESULTS) break;
+			}
 		}
-	}
 
-	return json(results, {
-		headers: { 'Cache-Control': 'no-store' }
-	});
+		return json(results, {
+			headers: stmResultHeaders(result, 'no-store')
+		});
+	} catch (err) {
+		return handleStmError(err);
+	}
 };

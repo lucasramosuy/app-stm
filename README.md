@@ -1,51 +1,93 @@
-# Buses Montevideo
+# Buses Montevideo (App STM)
 
-App de tiempo real de ómnibus para Montevideo, sobre la API oficial de STM
-(api.montevideo.gub.uy).
+Aplicación web moderna y rápida en tiempo real para visualizar ómnibus y paradas del transporte público de Montevideo (STM), construida sobre la API oficial de la Intendencia de Montevideo (`api.montevideo.gub.uy`).
 
-## Stack
+![Stack](https://img.shields.io/badge/SvelteKit-v5-FF3E00)
+![MapLibre](https://img.shields.io/badge/MapLibre_GL-v6-blue)
+![TypeScript](https://img.shields.io/badge/TypeScript-v5-blue)
+![Deploy](https://img.shields.io/badge/Deploy-Netlify-00C7B7)
 
-- SvelteKit (frontend + backend en el mismo proyecto)
-- MapLibre GL (mapa, sin API key)
-- Inter Variable (tipografía)
+---
 
-## Desarrollo local
+## 🚀 Características principales
 
-```bash
-npm install
-cp .env.example .env   # completá STM_CLIENT_ID y STM_CLIENT_SECRET
-npm run dev -- --host
-```
+- **Mapa interactivo en tiempo real**: Visualización de paradas y flota de colectivos en circulación con MapLibre GL (sin necesidad de API keys).
+- **Estimaciones de arribo (ETAs) precisas**: Tiempos de llegada actualizados cada 20 segundos con formato `tabular-nums` para evitar parpadeos visuales.
+- **Búsqueda rápida e inteligente**: Búsqueda instantánea con debouncing para paradas por intersección de calles y líneas de ómnibus.
+- **Paradas y Líneas Favoritas**: Marcadores fijos para guardar tus paradas habituales y líneas preferidas en `localStorage`.
+- **Historial de Recientes**: Acceso rápido a las últimas paradas y líneas consultadas, con scrollbar horizontal limpio e imperceptible.
+- **Deep Linking (Enlaces directos)**: Soporte para parámetros `?stop=` y `?line=` en la URL para compartir o guardar paradas y líneas específicas.
+- **Resiliencia y Caché SWR**: Capa de caché en servidor (`stmCache.ts`) con tolerancia a fallos ante errores `502`/`429` del backend de STM y fallback a datos guardados.
+- **Interfaz Adaptativa (Responsive)**: Bottom Sheet deslizable en dispositivos móviles y panel lateral colapsable en escritorio.
+- **Selección de buses individuales en el mapa.**
+- **Chip de estado del mapa.**
+- Indicador de datos demorados (badge "Demorado" cuando la API cachea una respuesta stale, con el header X-Data-Stale)
 
-Las credenciales se consiguen en https://api.montevideo.gub.uy → Mis Aplicaciones.
+---
 
-## Por qué Netlify (no Cloudflare Workers)
+## 🛠️ Stack Tecnológico
 
-El módulo `src/lib/server/stmAuth.ts` cachea el access token OAuth en memoria
-del proceso, para no pedir un token nuevo en cada request (el token dura 300s).
-Esto funciona bien en runtimes Node persistentes como los de Netlify, pero no
-es confiable en runtimes edge (Cloudflare Workers), que reciclan el proceso
-más agresivamente. Si en algún momento se migra a edge, ese cache debería
-pasar a un KV store en vez de una variable en memoria.
+- **Frontend / Backend**: [SvelteKit 2](https://svelte.dev/) con Svelte 5 (Runes).
+- **Mapa**: [MapLibre GL JS](https://maplibre.org/) con tiles vectoriales de OpenFreeMap.
+- **Estilos**: Vanilla CSS con variables de diseño (Tema Oscuro por defecto).
+- **Tipografía**: `Inter Variable` (@fontsource-variable/inter).
+- **Gestión de Paquetes**: `pnpm`.
 
-## Deploy en Netlify
+---
 
-1. Subir este repo a GitHub (sin el `.env`, ya está en `.gitignore`).
-2. En Netlify: "Add new site" → "Import an existing project" → conectar el repo.
-   Build command y publish directory ya quedan definidos en `netlify.toml`.
-3. **Antes del primer deploy**, cargar en Site settings → Environment variables:
-   - `STM_CLIENT_ID`
-   - `STM_CLIENT_SECRET`
+## 💻 Desarrollo local
 
-Nunca subir estos valores al repo ni pegarlos en ningún archivo versionado.
+1. **Clonar e instalar dependencias:**
+   ```bash
+   pnpm install
+   ```
 
-## Estado actual (WIP)
+2. **Configurar variables de entorno:**
+   Copiá `.env.example` a `.env` y completá tus credenciales de la API de la STM:
+   ```env
+   STM_CLIENT_ID="tu_client_id"
+   STM_CLIENT_SECRET="tu_client_secret"
+   ```
+   *Las credenciales se obtienen gratis en [api.montevideo.gub.uy](https://api.montevideo.gub.uy) (Sección Mis Aplicaciones).*
 
-- El mapa usa un estilo base gratuito de OpenFreeMap oscurecido con CSS,
-  como placeholder — falta el estilo oscuro custom definitivo.
-- La parada mostrada en el bottom sheet está fija (3914, 18 de Julio y Andes)
-  mientras no está implementado el tap sobre paradas reales en el mapa.
-- Los endpoints reales confirmados contra la API: `/buses/busstops`,
-  `/buses/busstops/{id}`, `/buses/busstops/{id}/upcomingbuses?lines=...`.
-  `/buses/geo` (buses en tiempo real por bounding box) todavía no se probó
-  contra la API real — los nombres de parámetros en el proxy son un supuesto.
+3. **Iniciar el servidor de desarrollo:**
+   ```bash
+   pnpm dev --host
+   ```
+
+4. **Verificación de tipos e integración:**
+   ```bash
+   pnpm check
+   pnpm build
+   ```
+
+---
+
+## ☁️ Arquitectura y Despliegue (Netlify)
+
+El módulo `src/lib/server/stmAuth.ts` cachea el token OAuth en la memoria del proceso (válido por 300s) para evitar sobrecargar los servidores de la STM con peticiones repetidas de autenticación.
+
+### Variables de entorno en Netlify:
+En **Site settings → Environment variables**, configurar:
+- `STM_CLIENT_ID`
+- `STM_CLIENT_SECRET`
+
+---
+
+## 📌 Estado Actual
+
+- ✅ **Paradas y tiempo real activos**: Selección de paradas en mapa/búsqueda con listado de próximos ómnibus.
+- ✅ **Favoritos y Recientes**: Persistencia local de paradas y líneas.
+- ✅ **Deep links activos**: URLs dinámicas con parámetro `?stop=` o `?line=`.
+- ✅ **Resiliencia de API**: Manejo de caché SWR y errores `502 Bad Gateway` / `429 Rate Limit`.
+- ✅ **Trazado de rutas**: Polyline del recorrido completo al filtrar por línea, generada offline desde el GTFS estático de STM.
+- ✅ **Geolocalización ("Mi Ubicación")**: Botón flotante para centrar el mapa en la ubicación del usuario y listar las paradas más cercanas automáticamente.
+
+---
+
+## 🗺️ Roadmap de Mejoras Pendientes
+
+- [ ] **📱 Soporte PWA (Progressive Web App)**: Instalación en pantalla de inicio de celulares y caché offline de la shell de la aplicación.
+- [ ] **🔔 Alertas y Notificaciones**: Notificar al usuario (sonido o notificación web) cuando el coche esperado esté a menos de 3 minutos.
+- [ ] **✨ Animación de Marcadores**: Interpolación suave del movimiento de los colectivos en el mapa (`requestAnimationFrame`) entre intervalos de polling.
+- [ ] **♿ Accesibilidad por Teclado**: Navegación con flechas en la lista desplegable de resultados de búsqueda.
