@@ -68,6 +68,11 @@
 	let tripOptions = $state<TripOption[] | null>(null);
 	let tripLoading = $state(false);
 	let tripSearchError = $state<string | null>(null);
+	// true mientras el usuario está en modo "elegir origen tocando el
+	// mapa/buscador" — mientras está activo, addStop/addBus/onSelectPoi/
+	// pickStopResult se redirigen a fijar origen en vez de hacer su
+	// selección normal (sumar a la pila, marcar destino, etc.).
+	let pickingOrigin = $state(false);
 
 	interface SearchStopResult {
 		busstopId: number;
@@ -170,6 +175,10 @@
 	}
 
 	async function addStop(busstopId: number, isDefault = false) {
+		if (pickingOrigin) {
+			await pickOriginFromStop(busstopId);
+			return;
+		}
 		if (selectedStops.some((s) => s.busstopId === busstopId)) return;
 
 		selectedLine = null;
@@ -238,6 +247,10 @@
 	}
 
 	function addBus(bus: MapBusSelection) {
+		if (pickingOrigin) {
+			setTripOrigin(`Línea ${bus.line} — ${bus.destination}`, bus.location.coordinates);
+			return;
+		}
 		if (selectedBuses.some((b) => b.busId === bus.busId)) return;
 		selectedBuses = [bus, ...selectedBuses];
 		sheetOpen = true;
@@ -283,6 +296,10 @@
 	function pickStopResult(stop: SearchStopResult) {
 		searchOpen = false;
 		query = '';
+		if (pickingOrigin) {
+			setTripOrigin(`${stop.street1} y ${stop.street2}`, stop.location.coordinates);
+			return;
+		}
 		addStop(stop.busstopId);
 	}
 
@@ -310,6 +327,7 @@
 
 	function setTripDestination(label: string, coordinates: [number, number]) {
 		tripDestination = { label, coordinates, type: 'point' };
+		pickingOrigin = false;
 		tripOptions = null;
 		tripSearchError = null;
 	}
@@ -317,6 +335,7 @@
 	function clearTripDestination() {
 		tripDestination = null;
 		tripOrigin = null;
+		pickingOrigin = false;
 		originError = null;
 		tripOptions = null;
 		tripSearchError = null;
@@ -324,6 +343,7 @@
 
 	function clearTripOrigin() {
 		tripOrigin = null;
+		pickingOrigin = false;
 		originError = null;
 		tripOptions = null;
 		tripSearchError = null;
@@ -339,6 +359,42 @@
 		tripSearchError = null;
 	}
 
+	/** Única función que efectivamente fija tripOrigin — la usan tanto
+	 * el GPS como cualquier punto elegido a mano (parada, bus, POI,
+	 * resultado de búsqueda), para que el reset de pickingOrigin y de
+	 * los resultados viejos de ruta pase siempre por el mismo lugar. */
+	function setTripOrigin(label: string, coordinates: [number, number], type: 'gps' | 'point' = 'point') {
+		tripOrigin = { label, coordinates, type };
+		pickingOrigin = false;
+		originError = null;
+		tripOptions = null;
+		tripSearchError = null;
+	}
+
+	function startPickOrigin() {
+		pickingOrigin = true;
+		originError = null;
+	}
+
+	function cancelPickOrigin() {
+		pickingOrigin = false;
+	}
+
+	/** Tocar una parada en el mapa mientras pickingOrigin está activo:
+	 * necesita el mismo fetch de detalle que addStop() para tener label
+	 * y coordenadas reales, pero SIN sumarla a la pila de selección. */
+	async function pickOriginFromStop(busstopId: number) {
+		try {
+			const res = await fetch(`/api/busstops/${busstopId}`);
+			if (!res.ok) throw new Error('No se pudo cargar la parada');
+			const detail: BusStopDetail = await res.json();
+			setTripOrigin(`${detail.calle1} y ${detail.calle2}`, detail.location.coordinates);
+		} catch (err) {
+			originError = err instanceof Error ? err.message : 'No se pudo usar esta parada como origen';
+			pickingOrigin = false;
+		}
+	}
+
 	function useMyLocationAsOrigin() {
 		if (!('geolocation' in navigator)) {
 			originError = 'Este navegador no soporta geolocalización.';
@@ -348,11 +404,7 @@
 		originError = null;
 		navigator.geolocation.getCurrentPosition(
 			(pos) => {
-				tripOrigin = {
-					label: 'Mi ubicación',
-					coordinates: [pos.coords.longitude, pos.coords.latitude],
-					type: 'gps'
-				};
+				setTripOrigin('Mi ubicación', [pos.coords.longitude, pos.coords.latitude], 'gps');
 				locatingOrigin = false;
 			},
 			() => {
@@ -368,6 +420,10 @@
 	 * "ir hasta acá". El origen se puede editar después con los
 	 * controles normales del panel. */
 	function selectPoiAsDestination(poi: { label: string; coordinates: [number, number] }) {
+		if (pickingOrigin) {
+			setTripOrigin(poi.label, poi.coordinates);
+			return;
+		}
 		setTripDestination(poi.label, poi.coordinates);
 		useMyLocationAsOrigin();
 	}
@@ -521,6 +577,9 @@
 		onSelectStop={addStop}
 		onSelectBus={addBus}
 		onSelectPoi={selectPoiAsDestination}
+		{tripOrigin}
+		{tripDestination}
+		tripOption={tripOptions?.[0] ?? null}
 	/>
 
 	<div
@@ -551,7 +610,10 @@
 					origin={tripOrigin}
 					{locatingOrigin}
 					{originError}
+					{pickingOrigin}
 					onUseMyLocation={useMyLocationAsOrigin}
+					onPickOnMap={startPickOrigin}
+					onCancelPickOrigin={cancelPickOrigin}
 					onClearOrigin={clearTripOrigin}
 					onClearDestination={clearTripDestination}
 					onSwap={swapTrip}

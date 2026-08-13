@@ -3,14 +3,10 @@
 	import { Map as MapLibreMap, NavigationControl, setWorkerUrl } from 'maplibre-gl';
 	import type { GeoJSONSource, MapGeoJSONFeature } from 'maplibre-gl';
 	import 'maplibre-gl/dist/maplibre-gl.css';
-	// Fix conocido para MapLibre GL v6 + Vite: el dependency optimizer de Vite
-	// pierde el archivo del worker si no se registra explícitamente así.
-	// ?worker&url (no ?url solo) es necesario: el worker importa un archivo
-	// hermano (maplibre-gl-shared.mjs) que ?url no arrastra.
-	// Ver: https://maplibre.org/maplibre-gl-js/docs/
 	import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 	import { buildDarkStyle } from '$lib/map/darkStyle';
 	import type { UpcomingBus } from '$lib/types/stm';
+	import type { TripOption } from '$lib/types/trip';
 
 	interface NearbyStop {
 		busstopId: number;
@@ -19,8 +15,6 @@
 		location: { coordinates: [number, number] };
 	}
 
-	/** Forma completa que necesitamos para pintar Y para poder construir un
-	 * MapBusSelection al tocar un bus en el mapa (viewport/line/stop). */
 	interface LiveBus {
 		busId: number;
 		line: string;
@@ -36,8 +30,6 @@
 		location: { coordinates: [number, number] };
 	}
 
-	/** Forma que recibe +page.svelte al seleccionar un bus, ya sea desde
-	 * el mapa (click directo) o desde la lista de ETAs del sidebar. */
 	export interface MapBusSelection {
 		busId: number;
 		line: string;
@@ -62,10 +54,12 @@
 		selectedStopName = null,
 		selectedBusIds = [],
 		filterLine = null,
+		tripOrigin = null,
+		tripDestination = null,
+		tripOption = null,
 		onSelectStop,
 		onSelectBus,
 		onSelectPoi
-
 	}: {
 		buses?: UpcomingBus[];
 		focusLocation?: [number, number] | null;
@@ -73,30 +67,20 @@
 		selectedStopName?: string | null;
 		selectedBusIds?: number[];
 		filterLine?: string | null;
+		tripOrigin?: { coordinates: [number, number] } | null;
+		tripDestination?: { coordinates: [number, number] } | null;
+		tripOption?: TripOption | null;
 		onSelectStop?: (busstopId: number) => void;
 		onSelectBus?: (bus: MapBusSelection) => void;
 		onSelectPoi?: (poi: { label: string; coordinates: [number, number] }) => void;
 	} = $props();
 
-	// Modo de qué buses mostrar en el mapa:
-	// - "line": se filtró una línea en el buscador → solo esos buses, en
-	//   toda la ciudad (no limitado al viewport).
-	// - "stop": hay una parada seleccionada → solo los buses que la sirven
-	//   (mismos datos que ya vienen en el sidebar, sin fetch propio).
-	// - "viewport": caso default → todos los buses visibles en el área
-	//   actual del mapa.
 	const busMode = $derived(filterLine ? 'line' : selectedStopIds.length > 0 ? 'stop' : 'viewport');
 
-	// Por debajo de este zoom no mostramos paradas: a nivel ciudad serían
-	// miles de puntos amontonados sin valor y con costo de red innecesario.
 	const MIN_ZOOM_FOR_STOPS = 15;
 	const BUSES_POLL_MS = 8_000;
 
-	// Centro de Montevideo (Plaza Independencia, aprox.)
 	const MONTEVIDEO_CENTER: [number, number] = [-56.1937, -34.9058];
-
-	// Estilo base gratuito de OpenFreeMap (sin API key), reescrito a nuestra
-	// paleta oscura en tiempo real por buildDarkStyle() — ver darkStyle.ts.
 	const STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
 
 	const STOPS_SOURCE_ID = 'stops';
@@ -111,51 +95,46 @@
 	const SHAPE_GLOW_LAYER_ID = 'route-shape-glow';
 	const SHAPE_LINE_LAYER_ID = 'route-shape-line';
 
-	// Capas de POI del estilo base Liberty (OpenFreeMap) — no son
-	// nuestras, ya vienen en el JSON del estilo. Confirmadas fetcheando
-	// STYLE_URL directo: poi_r1/r7/r20 son comercios y amenities
-	// genéricos (por rango de importancia), poi_transit cubre íconos de
-	// aeropuerto/bus/tren, airport es el ícono+label de aeródromos. Se
-	// engancha el click igual que en las capas propias, solo que estas
-	// ya existen en el estilo sin que nosotros las agreguemos.
-	const BASE_POI_LAYER_IDS = ['poi_r1', 'poi_r7', 'poi_r20', 'poi_transit', 'airport'];
-
-	// Violeta a propósito: las calles del estilo oscuro van de ocre
-	// (#e0a458, avenidas) a gris azulado (#3d4863/#8f97a8, calles menores).
-	// Ningún tono de esa familia sirve para el trazado sin confundirse con
-	// el mapa base — el violeta es el hueco cromático más cercano a los
-	// otros acentos (amarillo de buses/paradas, teal de "en vivo") sin
-	// pisar ninguno de los dos.
+	// Violeta para el trazado de "filtro de línea" (toda la ciudad).
 	const ROUTE_SHAPE_COLOR = '#a78bfa';
+
+	// Capas del viaje planificado ("Cómo llegar") — color distinto
+	// (celeste) para no confundirse con el violeta del filtro de línea,
+	// que puede coexistir en el mismo mapa en teoría.
+	const TRIP_WALK_SOURCE_ID = 'trip-walk';
+	const TRIP_WALK_LAYER_ID = 'trip-walk-line';
+	const TRIP_ROUTE_SOURCE_ID = 'trip-route';
+	const TRIP_ROUTE_LAYER_ID = 'trip-route-line';
+	const TRIP_POINTS_SOURCE_ID = 'trip-points';
+	const TRIP_POINTS_LAYER_ID = 'trip-points-circle';
+	const TRIP_ROUTE_COLOR = '#38bdf8';
+	const TRIP_WALK_COLOR = '#9aa3b2';
+
+	// Capas de POI del estilo base Liberty (OpenFreeMap) — no son
+	// nuestras, ya vienen en el JSON del estilo. poi_r1/r7/r20 son
+	// comercios y amenities genéricos (por rango de importancia),
+	// poi_transit cubre íconos de aeropuerto/bus/tren, airport es el
+	// ícono+label de aeródromos.
+	const BASE_POI_LAYER_IDS = ['poi_r1', 'poi_r7', 'poi_r20', 'poi_transit', 'airport'];
 
 	let mapContainer: HTMLDivElement;
 	let map: MapLibreMap | undefined;
 	let mapReady = $state(false);
 
-	// Sets, no un solo id: con selección múltiple hay que poder prender y
-	// apagar el feature-state de varias paradas/buses a la vez, y apagar
-	// los que quedaron marcados antes pero ya no forman parte de la
-	// selección actual.
 	let highlightedStopIds = new Set<number>();
 	let highlightedBusIds = new Set<number>();
 	let lastFitLine: string | null = null;
 	let lastShapeLine: string | null = null;
+	let lastTripKey: string | null = null;
 
 	let debugMessage = $state<string | null>(null);
 	let tilesLoaded = $state(false);
 
-	// Anuncio para lectores de pantalla al seleccionar una parada. No hay
-	// ningún requisito visual conocido para selectedStopName todavía —
-	// si en realidad se buscaba un label flotante sobre el pin, avisar y
-	// se cambia por eso.
 	let stopAnnouncement = $state('');
 	$effect(() => {
 		stopAnnouncement = selectedStopName ? `Parada seleccionada: ${selectedStopName}` : '';
 	});
 
-	// --- Geolocalización ("dónde estoy") ---
-	// Estado del botón: 'idle' (nunca se activó o se detuvo a mano),
-	// 'locating' (esperando el primer fix del GPS), 'active' (siguiendo).
 	let locateStatus = $state<'idle' | 'locating' | 'active'>('idle');
 	let geoError = $state<string | null>(null);
 	let watchId: number | null = null;
@@ -298,7 +277,6 @@
 		);
 	}
 
-	/** Modo "viewport": todos los buses en el área visible del mapa. */
 	async function fetchAndSyncBuses() {
 		if (!map) return;
 
@@ -321,15 +299,12 @@
 		}
 	}
 
-	/** Modo "line": solo los buses de una línea, en toda la ciudad. */
 	async function fetchAndSyncBusesByLine(line: string) {
 		try {
 			const res = await fetch(`/api/buses/by-line?line=${encodeURIComponent(line)}`);
 			if (res.ok) {
 				const list: LiveBus[] = await res.json();
 				syncBuses(list);
-				// Solo encuadra el mapa la primera vez que se activa el filtro,
-				// no en cada refresco periódico (si no, "salta" cada 8s).
 				if (lastFitLine !== line) {
 					fitToBuses(list);
 					lastFitLine = line;
@@ -340,11 +315,6 @@
 		}
 	}
 
-	// --- Trazado de línea (GTFS shapes) ---
-
-	/** Fetchea la geometría de una línea UNA vez al activar el filtro (no
-	 * en cada poll de 8s) — mismo criterio que lastFitLine para no
-	 * "saltar" ni volver a pedir de más. */
 	async function fetchAndSyncShape(line: string) {
 		try {
 			const res = await fetch(`/api/lines/${encodeURIComponent(line)}/shape`);
@@ -368,26 +338,160 @@
 		source?.setData({ type: 'FeatureCollection', features: [] });
 	}
 
-	// --- Punto "dónde estoy" ---
+	// --- Trazado del viaje planificado ("Cómo llegar") ---
 
-	/**
-	 * Convierte metros a píxeles de pantalla en la latitud y zoom dados.
-	 * Fórmula estándar de proyección Web Mercator (256px de tile a zoom 0).
-	 * Se usa para que el círculo de precisión del GPS tenga un tamaño
-	 * geográficamente correcto en vez de un radio fijo arbitrario.
-	 */
+	/** Distancia al cuadrado en grados — solo sirve para COMPARAR y
+	 * elegir el punto/variante más cercano, no es una distancia real en
+	 * metros. Alcanza para esto porque es puramente visual. */
+	function degDistSq(a: [number, number], b: [number, number]): number {
+		const dx = a[0] - b[0];
+		const dy = a[1] - b[1];
+		return dx * dx + dy * dy;
+	}
+
+	function nearestIndex(point: [number, number], coords: number[][]): { index: number; distSq: number } {
+		let bestIndex = 0;
+		let bestDist = Infinity;
+		coords.forEach((c, i) => {
+			const d = degDistSq(point, c as [number, number]);
+			if (d < bestDist) {
+				bestDist = d;
+				bestIndex = i;
+			}
+		});
+		return { index: bestIndex, distSq: bestDist };
+	}
+
+	/** Una línea puede tener varias variantes de recorrido (ida/vuelta,
+	 * ramales). Elige la que pasa más cerca de ambas paradas del tramo, y
+	 * devuelve SOLO el segmento entre esas dos paradas — no el recorrido
+	 * completo de la línea, que sería ruidoso para un viaje puntual. */
+	function clipShapeToLeg(
+		boardCoord: [number, number],
+		alightCoord: [number, number],
+		features: { geometry: { coordinates: number[][] } }[]
+	): number[][] | null {
+		let best: number[][] | null = null;
+		let bestScore = Infinity;
+
+		for (const f of features) {
+			const coords = f.geometry.coordinates;
+			if (coords.length < 2) continue;
+			const nb = nearestIndex(boardCoord, coords);
+			const na = nearestIndex(alightCoord, coords);
+			const score = nb.distSq + na.distSq;
+			if (score < bestScore) {
+				bestScore = score;
+				const [start, end] = nb.index <= na.index ? [nb.index, na.index] : [na.index, nb.index];
+				best = coords.slice(start, end + 1);
+			}
+		}
+
+		return best;
+	}
+
+	async function fetchAndSyncTripRoute(
+		option: TripOption,
+		origin: [number, number],
+		destination: [number, number]
+	) {
+		if (!map) return;
+		const routeSource = map.getSource(TRIP_ROUTE_SOURCE_ID) as GeoJSONSource | undefined;
+		const walkSource = map.getSource(TRIP_WALK_SOURCE_ID) as GeoJSONSource | undefined;
+		const pointsSource = map.getSource(TRIP_POINTS_SOURCE_ID) as GeoJSONSource | undefined;
+		if (!routeSource || !walkSource || !pointsSource) return;
+
+		pointsSource.setData({
+			type: 'FeatureCollection',
+			features: [
+				{ type: 'Feature', properties: { kind: 'origin' }, geometry: { type: 'Point', coordinates: origin } },
+				{
+					type: 'Feature',
+					properties: { kind: 'destination' },
+					geometry: { type: 'Point', coordinates: destination }
+				}
+			]
+		});
+
+		const firstBoard = option.legs[0].boardStop.coordinates;
+		const lastAlight = option.legs[option.legs.length - 1].alightStop.coordinates;
+
+		// Caminatas como línea recta punteada — no hay ruteo peatonal
+		// real disponible, es solo una referencia de "hacia dónde
+		// caminar", no calles exactas.
+		walkSource.setData({
+			type: 'FeatureCollection',
+			features: [
+				{ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [origin, firstBoard] } },
+				{
+					type: 'Feature',
+					properties: {},
+					geometry: { type: 'LineString', coordinates: [lastAlight, destination] }
+				}
+			]
+		});
+
+		try {
+			const shapeResults = await Promise.all(
+				option.legs.map(async (leg) => {
+					const res = await fetch(`/api/lines/${encodeURIComponent(leg.line)}/shape`);
+					if (!res.ok) return null;
+					const geojson = await res.json();
+					return clipShapeToLeg(leg.boardStop.coordinates, leg.alightStop.coordinates, geojson.features ?? []);
+				})
+			);
+
+			routeSource.setData({
+				type: 'FeatureCollection',
+				features: shapeResults
+					.filter((coords): coords is number[][] => coords !== null && coords.length >= 2)
+					.map((coords) => ({
+						type: 'Feature' as const,
+						properties: {},
+						geometry: { type: 'LineString' as const, coordinates: coords }
+					}))
+			});
+		} catch (err) {
+			console.warn('[BusMap] no se pudo dibujar el trazado del viaje', err);
+			routeSource.setData({ type: 'FeatureCollection', features: [] });
+		}
+
+		const allPoints = [
+			origin,
+			destination,
+			...option.legs.flatMap((l) => [l.boardStop.coordinates, l.alightStop.coordinates])
+		];
+		let minLng = Infinity;
+		let minLat = Infinity;
+		let maxLng = -Infinity;
+		let maxLat = -Infinity;
+		for (const [lng, lat] of allPoints) {
+			minLng = Math.min(minLng, lng);
+			maxLng = Math.max(maxLng, lng);
+			minLat = Math.min(minLat, lat);
+			maxLat = Math.max(maxLat, lat);
+		}
+		map.fitBounds(
+			[
+				[minLng, minLat],
+				[maxLng, maxLat]
+			],
+			{ padding: 80, maxZoom: 16, duration: 900 }
+		);
+	}
+
+	function clearTripRoute() {
+		const routeSource = map?.getSource(TRIP_ROUTE_SOURCE_ID) as GeoJSONSource | undefined;
+		const walkSource = map?.getSource(TRIP_WALK_SOURCE_ID) as GeoJSONSource | undefined;
+		const pointsSource = map?.getSource(TRIP_POINTS_SOURCE_ID) as GeoJSONSource | undefined;
+		routeSource?.setData({ type: 'FeatureCollection', features: [] });
+		walkSource?.setData({ type: 'FeatureCollection', features: [] });
+		pointsSource?.setData({ type: 'FeatureCollection', features: [] });
+	}
+
 	function metersToPixels(meters: number, latitude: number, zoom: number): number {
 		const metersPerPixel = (156543.03392 * Math.cos((latitude * Math.PI) / 180)) / 2 ** zoom;
 		return meters / metersPerPixel;
-	}
-
-	/** El estilo arma el label visible con una expresión (coalesce +
-	 * concat de name:nonlatin) que no podemos leer desde acá — feature.
-	 * properties trae los campos crudos del vector tile. Este fallback
-	 * cubre el caso común (sin nombre no-latino, que es lo esperable
-	 * para Montevideo). */
-	function getPoiName(props: Record<string, unknown>): string {
-		return String(props.name_en ?? props.name ?? props['name:latin'] ?? 'Punto en el mapa');
 	}
 
 	function updateUserLocationLayer() {
@@ -407,8 +511,6 @@
 		});
 
 		const radiusPx = metersToPixels(lastUserAccuracy, lastUserCoords[1], map.getZoom());
-		// Radio mínimo para que el círculo no desaparezca con muy buena
-		// precisión (GPS urbano real rara vez baja de ~5-10m).
 		map.setPaintProperty(USER_LOCATION_ACCURACY_LAYER_ID, 'circle-radius', Math.max(radiusPx, 12));
 	}
 
@@ -484,9 +586,10 @@
 		}
 	}
 
-	// Decide qué mostrar según el modo activo. Se dispara al montar, y cada
-	// vez que cambian selectedStopId, filterLine, o los datos de `buses`
-	// (el sidebar los refresca cada 12s con polling propio).
+	function getPoiName(props: Record<string, unknown>): string {
+		return String(props.name_en ?? props.name ?? props['name:latin'] ?? 'Punto en el mapa');
+	}
+
 	$effect(() => {
 		if (!mapReady) return;
 
@@ -500,7 +603,7 @@
 					subline: b.subline,
 					special: b.special,
 					company: b.companyName,
-					speed: 0, // upcomingbuses no trae velocidad instantánea
+					speed: 0,
 					access: b.access,
 					thermalConfort: b.thermalConfort,
 					emissions: b.emissions,
@@ -515,8 +618,6 @@
 		}
 	});
 
-	// Trazado de línea: se pide solo al entrar en modo "line" (no en cada
-	// poll de buses), y se limpia al salir de ese modo.
 	$effect(() => {
 		if (!mapReady) return;
 
@@ -528,6 +629,25 @@
 		} else if (lastShapeLine !== null) {
 			clearShape();
 			lastShapeLine = null;
+		}
+	});
+
+	$effect(() => {
+		if (!mapReady) return;
+
+		if (tripOption && tripOrigin && tripDestination) {
+			const key = JSON.stringify({
+				o: tripOrigin.coordinates,
+				d: tripDestination.coordinates,
+				legs: tripOption.legs.map((l) => `${l.line}:${l.boardStop.busstopId}:${l.alightStop.busstopId}`)
+			});
+			if (lastTripKey !== key) {
+				lastTripKey = key;
+				fetchAndSyncTripRoute(tripOption, tripOrigin.coordinates, tripDestination.coordinates);
+			}
+		} else if (lastTripKey !== null) {
+			lastTripKey = null;
+			clearTripRoute();
 		}
 	});
 
@@ -575,16 +695,10 @@
 			map.on('load', () => {
 				if (!map) return;
 
-				// Trazado de línea: se agrega ANTES que paradas y buses para
-				// que quede visualmente por debajo de esos puntos (orden de
-				// addLayer = orden de pintado, últimas capas quedan arriba).
 				map.addSource(SHAPE_SOURCE_ID, {
 					type: 'geojson',
 					data: { type: 'FeatureCollection', features: [] }
 				});
-				// Glow debajo de la línea nítida: línea ancha, semitransparente
-				// y difuminada, para que el trazado se lea bien contra calles
-				// oscuras sin depender solo del color.
 				map.addLayer({
 					id: SHAPE_GLOW_LAYER_ID,
 					type: 'line',
@@ -605,6 +719,42 @@
 					paint: {
 						'line-color': ROUTE_SHAPE_COLOR,
 						'line-width': 3.5,
+						'line-opacity': 0.95
+					}
+				});
+
+				// Viaje planificado: caminatas punteadas por debajo del
+				// trazado de línea, para que la línea sólida quede como
+				// elemento principal.
+				map.addSource(TRIP_WALK_SOURCE_ID, {
+					type: 'geojson',
+					data: { type: 'FeatureCollection', features: [] }
+				});
+				map.addLayer({
+					id: TRIP_WALK_LAYER_ID,
+					type: 'line',
+					source: TRIP_WALK_SOURCE_ID,
+					layout: { 'line-join': 'round', 'line-cap': 'round' },
+					paint: {
+						'line-color': TRIP_WALK_COLOR,
+						'line-width': 2,
+						'line-dasharray': [1, 2],
+						'line-opacity': 0.85
+					}
+				});
+
+				map.addSource(TRIP_ROUTE_SOURCE_ID, {
+					type: 'geojson',
+					data: { type: 'FeatureCollection', features: [] }
+				});
+				map.addLayer({
+					id: TRIP_ROUTE_LAYER_ID,
+					type: 'line',
+					source: TRIP_ROUTE_SOURCE_ID,
+					layout: { 'line-join': 'round', 'line-cap': 'round' },
+					paint: {
+						'line-color': TRIP_ROUTE_COLOR,
+						'line-width': 5,
 						'line-opacity': 0.95
 					}
 				});
@@ -650,24 +800,6 @@
 						'circle-stroke-width': ['case', ['boolean', ['feature-state', 'selected'], false], 3, 2]
 					}
 				});
-				// Tap sobre cualquier ícono del mapa base (comercios, parques,
-				// terminales, etc.) — no son capas nuestras, así que no hay
-				// addLayer acá, solo nos enganchamos a las que ya trae el estilo.
-				for (const layerId of BASE_POI_LAYER_IDS) {
-					map.on('click', layerId, (e) => {
-						const feature = e.features?.[0] as MapGeoJSONFeature | undefined;
-						if (!feature || feature.geometry.type !== 'Point') return;
-						const coordinates = (feature.geometry as { coordinates: [number, number] }).coordinates;
-						const label = getPoiName(feature.properties as Record<string, unknown>);
-						onSelectPoi?.({ label, coordinates });
-					});
-					map.on('mouseenter', layerId, () => {
-						if (map) map.getCanvas().style.cursor = 'pointer';
-					});
-					map.on('mouseleave', layerId, () => {
-						if (map) map.getCanvas().style.cursor = '';
-					});
-				}
 				map.addLayer({
 					id: BUSES_LABEL_LAYER_ID,
 					type: 'symbol',
@@ -682,9 +814,6 @@
 					paint: { 'text-color': '#0B1220' }
 				});
 
-				// Capas del punto "dónde estoy", por encima de paradas y buses:
-				// círculo de precisión (radio en metros→px, ver
-				// metersToPixels) + punto sólido encima.
 				map.addSource(USER_LOCATION_SOURCE_ID, {
 					type: 'geojson',
 					data: { type: 'FeatureCollection', features: [] }
@@ -714,6 +843,24 @@
 					}
 				});
 
+				// Puntos de origen/destino del viaje: por encima de todo lo
+				// demás, para que siempre sean el elemento más visible.
+				map.addSource(TRIP_POINTS_SOURCE_ID, {
+					type: 'geojson',
+					data: { type: 'FeatureCollection', features: [] }
+				});
+				map.addLayer({
+					id: TRIP_POINTS_LAYER_ID,
+					type: 'circle',
+					source: TRIP_POINTS_SOURCE_ID,
+					paint: {
+						'circle-radius': 9,
+						'circle-color': ['match', ['get', 'kind'], 'origin', '#5eead4', 'destination', '#ffc93c', '#ffffff'],
+						'circle-stroke-color': '#0B1220',
+						'circle-stroke-width': 3
+					}
+				});
+
 				map.on('click', STOPS_LAYER_ID, (e) => {
 					const feature = e.features?.[0] as MapGeoJSONFeature | undefined;
 					const busstopId = feature?.properties?.busstopId;
@@ -728,9 +875,6 @@
 					if (map) map.getCanvas().style.cursor = '';
 				});
 
-				// Registrado solo en la capa circle, no en la de label (mismo
-				// motivo que el bug ya resuelto con las paradas: registrar en
-				// ambas capas duplica el evento si un punto cae bajo las dos).
 				map.on('click', BUSES_CIRCLE_LAYER_ID, (e) => {
 					const feature = e.features?.[0] as MapGeoJSONFeature | undefined;
 					if (!feature) return;
@@ -760,8 +904,22 @@
 					if (map) map.getCanvas().style.cursor = '';
 				});
 
-				// El círculo de precisión es en metros reales: si cambia el
-				// zoom hay que recalcular su radio en píxeles.
+				for (const layerId of BASE_POI_LAYER_IDS) {
+					map.on('click', layerId, (e) => {
+						const feature = e.features?.[0] as MapGeoJSONFeature | undefined;
+						if (!feature || feature.geometry.type !== 'Point') return;
+						const coordinates = (feature.geometry as { coordinates: [number, number] }).coordinates;
+						const label = getPoiName(feature.properties as Record<string, unknown>);
+						onSelectPoi?.({ label, coordinates });
+					});
+					map.on('mouseenter', layerId, () => {
+						if (map) map.getCanvas().style.cursor = 'pointer';
+					});
+					map.on('mouseleave', layerId, () => {
+						if (map) map.getCanvas().style.cursor = '';
+					});
+				}
+
 				map.on('zoom', () => {
 					if (lastUserCoords) updateUserLocationLayer();
 				});
@@ -770,9 +928,6 @@
 				fetchAndSyncNearbyStops();
 				if (lastUserCoords) updateUserLocationLayer();
 
-				// Refresco periódico: los buses se mueven aunque el mapa esté
-				// quieto. En modo "stop" no hace falta (el prop `buses` ya se
-				// refresca solo desde afuera cada 12s).
 				busesPollInterval = setInterval(() => {
 					if (busMode === 'line' && filterLine) {
 						fetchAndSyncBusesByLine(filterLine);

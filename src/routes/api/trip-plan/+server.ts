@@ -1,5 +1,6 @@
 import { json, error } from '@sveltejs/kit';
 import { planTrip, DEFAULT_WALK_RADIUS_M } from '$lib/server/tripPlanner';
+import { handleStmError } from '$lib/server/stmHttp';
 import type { RequestHandler } from './$types';
 
 export const GET: RequestHandler = async ({ url }) => {
@@ -18,6 +19,6 @@ export const GET: RequestHandler = async ({ url }) => {
 		return json(result, { headers: { 'Cache-Control': 'no-store' } });
 	} catch (err) {
 		console.error('[trip-plan] error calculando ruta', err);
-		throw error(500, 'No se pudo calcular la ruta');
+		return handleStmError(err);
 	}
 };

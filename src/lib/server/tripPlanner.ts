@@ -25,7 +25,7 @@ interface StopWithLines {
 }
 
 async function findNearbyStopsWithLines(point: [number, number], radiusM: number): Promise<StopWithLines[]> {
-	const allStops = await getBusStops();
+	const { data: allStops } = await getBusStops();
 	const nearby = allStops
 		.map((s) => ({ stop: s, distance: haversineDistance(point, s.location.coordinates) }))
 		.filter((s) => s.distance <= radiusM)
@@ -35,7 +35,7 @@ async function findNearbyStopsWithLines(point: [number, number], radiusM: number
 	const results: StopWithLines[] = [];
 	for (const { stop, distance } of nearby) {
 		try {
-			const detail = await getBusStopDetail(stop.busstopId);
+			const { data: detail } = await getBusStopDetail(stop.busstopId);
 			results.push({
 				busstopId: stop.busstopId,
 				street1: stop.street1,
