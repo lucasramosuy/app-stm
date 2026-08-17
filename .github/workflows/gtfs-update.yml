@@ -1,0 +1,93 @@
+name: GTFS update check
+
+on:
+  schedule:
+    # Todos los lunes 09:00 UTC (~06:00 en Montevideo). Cron corre en
+    # UTC siempre, GitHub no ajusta por huso horario.
+    - cron: '0 9 * * 1'
+  workflow_dispatch: {} # permite correrlo a mano desde la pestaña Actions
+
+env:
+  GTFS_VERSION_URL: https://api.montevideo.gub.uy/api/transportepublico/buses/gtfs/static/latest/version.txt
+  GTFS_ZIP_URL: https://api.montevideo.gub.uy/api/transportepublico/buses/gtfs/static/latest/google_transit.zip
+  GTFS_VERSION_FILE: src/lib/server/data/gtfs-version.txt
+  GTFS_DIR: /tmp/gtfs
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Consultar versión actual del GTFS de STM
+        id: remote
+        run: |
+          VERSION=$(curl -fsSL "$GTFS_VERSION_URL")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Versión remota: $VERSION"
+
+      - name: Comparar contra la versión guardada
+        id: compare
+        run: |
+          if [ -f "$GTFS_VERSION_FILE" ]; then
+            LOCAL_VERSION=$(cat "$GTFS_VERSION_FILE")
+          else
+            LOCAL_VERSION=""
+          fi
+          echo "Versión guardada: $LOCAL_VERSION"
+          if [ "$LOCAL_VERSION" = "${{ steps.remote.outputs.version }}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: pnpm/action-setup@v4
+        if: steps.compare.outputs.changed == 'true'
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        if: steps.compare.outputs.changed == 'true'
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Instalar dependencias
+        if: steps.compare.outputs.changed == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Descargar y descomprimir GTFS nuevo
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          mkdir -p "$GTFS_DIR"
+          curl -fsSL "$GTFS_ZIP_URL" -o /tmp/google_transit.zip
+          unzip -o /tmp/google_transit.zip -d "$GTFS_DIR"
+
+      - name: Regenerar route-shapes.json
+        if: steps.compare.outputs.changed == 'true'
+        run: node scripts/build-shapes.mjs "$GTFS_DIR"
+
+      - name: Actualizar archivo de versión
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          mkdir -p "$(dirname "$GTFS_VERSION_FILE")"
+          echo "${{ steps.remote.outputs.version }}" > "$GTFS_VERSION_FILE"
+
+      - name: Abrir PR con los shapes actualizados
+        if: steps.compare.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: 'chore(gtfs): actualizar route-shapes.json a versión ${{ steps.remote.outputs.version }}'
+          title: 'GTFS actualizado: versión ${{ steps.remote.outputs.version }}'
+          body: |
+            STM publicó una nueva versión del GTFS estático (`${{ steps.remote.outputs.version }}`).
+
+            Este PR regenera `route-shapes.json` a partir del nuevo `google_transit.zip`.
+
+            **Revisar antes de mergear:** confirmar visualmente en el mapa que los
+            trazados de algunas líneas conocidas no se rompieron (cambios de
+            recorrido, líneas nuevas, líneas dadas de baja).
+          branch: gtfs-update-${{ steps.remote.outputs.version }}
+          add-paths: |
+            src/lib/server/data/route-shapes.json
+            ${{ env.GTFS_VERSION_FILE }}
