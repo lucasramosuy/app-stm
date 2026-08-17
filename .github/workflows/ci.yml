@@ -10,19 +10,18 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      # Si tu package.json tiene el campo "packageManager" (ej.
-      # "pnpm@9.x.x"), esta action detecta la versión sola y podés
-      # borrar la línea "with: version:" de abajo.
-      - uses: pnpm/action-setup@v4
+      # pnpm/setup reemplaza a pnpm/action-setup + actions/setup-node en
+      # un solo paso (instala pnpm y Node juntos). Si tu package.json
+      # tiene el campo "packageManager" (ej. "pnpm@9.x.x"), lo detecta
+      # solo y podés borrar la línea "version:" de abajo.
+      - uses: pnpm/setup@v2
         with:
-          version: 9
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'pnpm'
+          version: 11
+          runtime: node@20
+          cache: true
+          install: false # instalamos nosotros abajo, con --frozen-lockfile
 
       - name: Instalar dependencias
         run: pnpm install --frozen-lockfile

@@ -17,7 +17,7 @@ jobs:
   check-and-update:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Consultar versión actual del GTFS de STM
         id: remote
@@ -41,16 +41,13 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/setup@v2
         if: steps.compare.outputs.changed == 'true'
         with:
-          version: 9
-
-      - uses: actions/setup-node@v4
-        if: steps.compare.outputs.changed == 'true'
-        with:
-          node-version: 20
-          cache: 'pnpm'
+          version: 11
+          runtime: node@20
+          cache: true
+          install: false
 
       - name: Instalar dependencias
         if: steps.compare.outputs.changed == 'true'
