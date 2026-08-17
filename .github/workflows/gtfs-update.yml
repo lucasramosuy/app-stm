@@ -93,10 +93,32 @@ jobs:
         run: |
           mkdir -p "$GTFS_DIR"
 
-          curl -fsSL \
-            "$GTFS_ZIP_URL" \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            -o /tmp/google_transit.zip
+          for attempt in 1 2 3 4 5; do
+            echo "Intento de descarga $attempt/5..."
+            rm -f /tmp/google_transit.zip
+
+            if curl -fL \
+                --retry 3 \
+                --retry-delay 5 \
+                --retry-all-errors \
+                --connect-timeout 30 \
+                --max-time 300 \
+                "$GTFS_ZIP_URL" \
+                -H "Authorization: Bearer $ACCESS_TOKEN" \
+                -o /tmp/google_transit.zip \
+              && unzip -tq /tmp/google_transit.zip > /dev/null 2>&1; then
+              echo "Descarga completa y zip válido."
+              break
+            fi
+
+            if [ "$attempt" = "5" ]; then
+              echo "No se pudo obtener un zip válido tras 5 intentos completos."
+              exit 1
+            fi
+
+            echo "Descarga incompleta o zip corrupto, reintentando en 10s..."
+            sleep 10
+          done
 
           unzip -o /tmp/google_transit.zip -d "$GTFS_DIR"
 
