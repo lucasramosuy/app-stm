@@ -7,6 +7,12 @@ on:
     - cron: '0 9 * * 1'
   workflow_dispatch: {}
 
+# El GITHUB_TOKEN por default es solo lectura. create-pull-request
+# necesita escribir la rama nueva y abrir el PR.
+permissions:
+  contents: write
+  pull-requests: write
+
 env:
   GTFS_VERSION_URL: https://api.montevideo.gub.uy/api/transportepublico/buses/gtfs/static/latest/version.txt
   GTFS_ZIP_URL: https://api.montevideo.gub.uy/api/transportepublico/buses/gtfs/static/latest/google_transit.zip
@@ -134,7 +140,7 @@ jobs:
 
       - name: Abrir PR con los shapes actualizados
         if: steps.compare.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v7
         with:
           commit-message: 'chore(gtfs): actualizar route-shapes.json a versión ${{ steps.remote.outputs.version }}'
           title: 'GTFS actualizado: versión ${{ steps.remote.outputs.version }}'
