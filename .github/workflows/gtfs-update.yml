@@ -21,8 +21,14 @@ jobs:
 
       - name: Consultar versión actual del GTFS de STM
         id: remote
+        env:
+          STM_CLIENT_ID: ${{ secrets.STM_CLIENT_ID }}
+          STM_CLIENT_SECRET: ${{ secrets.STM_CLIENT_SECRET }}
         run: |
-          VERSION=$(curl -fsSL "$GTFS_VERSION_URL")
+          VERSION=$(curl -fsSL "$GTFS_VERSION_URL" \
+          -H "STM_CLIENT_ID: $STM_CLIENT_ID" \
+          -H "STM_CLIENT_SECRET: $STM_CLIENT_SECRET")
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Versión remota: $VERSION"
 
@@ -55,9 +61,17 @@ jobs:
 
       - name: Descargar y descomprimir GTFS nuevo
         if: steps.compare.outputs.changed == 'true'
+        env:
+          STM_CLIENT_ID: ${{ secrets.STM_CLIENT_ID }}
+          STM_CLIENT_SECRET: ${{ secrets.STM_CLIENT_SECRET }}
         run: |
           mkdir -p "$GTFS_DIR"
-          curl -fsSL "$GTFS_ZIP_URL" -o /tmp/google_transit.zip
+
+          curl -fsSL "$GTFS_ZIP_URL" \
+          -H "STM_CLIENT_ID: $STM_CLIENT_ID" \
+          -H "STM_CLIENT_SECRET: $STM_CLIENT_SECRET" \
+          -o /tmp/google_transit.zip
+
           unzip -o /tmp/google_transit.zip -d "$GTFS_DIR"
 
       - name: Regenerar route-shapes.json
