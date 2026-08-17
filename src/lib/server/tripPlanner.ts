@@ -1,19 +1,24 @@
 import { getBusStops, getBusStopDetail } from './stmCache';
+import { getStmRateLimitCooldownMs } from './stmApi';
 import { getRouteShape } from './routeShapes';
 import { haversineDistance, pointToPolylineMeters, polylineToPolylineMeters } from './geo';
 import type { TripOption } from '$lib/types/trip';
 
 export const DEFAULT_WALK_RADIUS_M = 500;
 
-// Qué tan cerca tienen que pasar dos TRAZADOS para considerarse
-// conectados en un transbordo. Más generoso que el radio de caminata
-// porque acá se compara contra el recorrido completo de la línea, no
-// contra una parada puntual — dos líneas pueden cruzarse en una esquina
-// sin compartir oficialmente ninguna parada según el dato de STM.
 const LINE_PROXIMITY_M = 250;
-const MAX_CANDIDATE_LINES = 8;
+const MAX_CANDIDATE_LINES = 5;
 const MAX_RESULTS = 5;
-const MAX_NEARBY_STOPS = 15;
+const MAX_NEARBY_STOPS = 10;
+
+// Techo duro de pedidos NUEVOS a la API de STM por cada llamada a
+// planTrip(). Sin esto, la búsqueda de transbordo (que compara cada
+// línea candidata de origen contra cada una de destino) puede disparar
+// decenas de búsquedas de "paradas cercanas al cruce", cada una
+// pidiendo detalle de hasta MAX_NEARBY_STOPS paradas — sin límite,
+// eso escaló a cientos de pedidos reales en un solo cálculo de ruta y
+// tumbó el rate limit de STM para toda la app (visto en producción).
+const MAX_NEW_DETAIL_FETCHES = 30;
 
 interface StopWithLines {
 	busstopId: number;
@@ -24,7 +29,25 @@ interface StopWithLines {
 	lines: string[];
 }
 
-async function findNearbyStopsWithLines(point: [number, number], radiusM: number): Promise<StopWithLines[]> {
+/** Estado compartido durante UNA llamada a planTrip(): evita pedir el
+ * detalle de la misma parada dos veces (ej. dos puntos de transbordo
+ * cercanos entre sí que comparten paradas vecinas) y aplica el techo
+ * global de pedidos nuevos. No persiste entre llamadas — es solo para
+ * no repetir trabajo dentro de un mismo cálculo. */
+interface FetchBudget {
+	cache: Map<number, StopWithLines | null>; // null = se intentó y falló, no reintentar en esta llamada
+	remaining: number;
+}
+
+function createFetchBudget(): FetchBudget {
+	return { cache: new Map(), remaining: MAX_NEW_DETAIL_FETCHES };
+}
+
+async function findNearbyStopsWithLines(
+	point: [number, number],
+	radiusM: number,
+	budget: FetchBudget
+): Promise<StopWithLines[]> {
 	const { data: allStops } = await getBusStops();
 	const nearby = allStops
 		.map((s) => ({ stop: s, distance: haversineDistance(point, s.location.coordinates) }))
@@ -34,20 +57,39 @@ async function findNearbyStopsWithLines(point: [number, number], radiusM: number
 
 	const results: StopWithLines[] = [];
 	for (const { stop, distance } of nearby) {
+		const cached = budget.cache.get(stop.busstopId);
+		if (cached) {
+			// Reusar tal cual, pero con la distancia relativa a ESTE punto
+			// (la misma parada puede estar cerca de más de un punto de
+			// interés con distancias distintas).
+			results.push({ ...cached, distance });
+			continue;
+		}
+		if (cached === null) continue; // ya se intentó antes en esta llamada y falló
+
+		if (budget.remaining <= 0 || getStmRateLimitCooldownMs() > 0) {
+			// Presupuesto agotado o STM ya nos frenó: seguimos con lo que
+			// tengamos, no insistimos. Se marca como "no intentado" (no se
+			// guarda en cache) por si queda presupuesto más adelante en
+			// esta misma llamada.
+			continue;
+		}
+
+		budget.remaining -= 1;
 		try {
 			const { data: detail } = await getBusStopDetail(stop.busstopId);
-			results.push({
+			const withLines: StopWithLines = {
 				busstopId: stop.busstopId,
 				street1: stop.street1,
 				street2: stop.street2,
 				distance,
 				coordinates: stop.location.coordinates,
 				lines: detail.lineas ?? []
-			});
+			};
+			budget.cache.set(stop.busstopId, withLines);
+			results.push(withLines);
 		} catch {
-			// Una parada puntual que falla (ej. 429 momentáneo) se
-			// descarta — no vale la pena tirar abajo toda la búsqueda de
-			// ruta por una sola parada rota.
+			budget.cache.set(stop.busstopId, null);
 		}
 	}
 	return results;
@@ -104,9 +146,6 @@ function linesAreTransferable(lineA: string, lineB: string): boolean {
 	return false;
 }
 
-/** Punto aproximado de cruce entre dos líneas: el punto del shape de L1
- * más cercano a cualquier shape de L2. Ahí buscamos paradas reales que
- * sirvan L1 (para bajarse) y L2 (para subirse). */
 function findCrossPoint(lineA: string, lineB: string): [number, number] | null {
 	const shapesA = getRouteShape(lineA);
 	const shapesB = getRouteShape(lineB);
@@ -131,7 +170,8 @@ function findCrossPoint(lineA: string, lineB: string): [number, number] | null {
 async function oneTransferOptions(
 	originStops: StopWithLines[],
 	destStops: StopWithLines[],
-	radiusM: number
+	radiusM: number,
+	budget: FetchBudget
 ): Promise<TripOption[]> {
 	const originLines = [...new Set(originStops.flatMap((s) => s.lines))].slice(0, MAX_CANDIDATE_LINES);
 	const destLines = [...new Set(destStops.flatMap((s) => s.lines))].slice(0, MAX_CANDIDATE_LINES);
@@ -140,13 +180,23 @@ async function oneTransferOptions(
 
 	for (const l1 of originLines) {
 		for (const l2 of destLines) {
-			if (l1 === l2) continue; // eso ya lo cubre directOptions
+			if (budget.remaining <= 0 || getStmRateLimitCooldownMs() > 0) {
+				// Sin presupuesto (o STM en cooldown): devolvemos lo que
+				// ya hayamos encontrado hasta acá, mejor incompleto que
+				// seguir insistiendo.
+				return options.sort(
+					(a, b) =>
+						a.walkToFirstStopM + a.walkFromLastStopM - (b.walkToFirstStopM + b.walkFromLastStopM)
+				);
+			}
+
+			if (l1 === l2) continue;
 			if (!linesAreTransferable(l1, l2)) continue;
 
 			const crossPoint = findCrossPoint(l1, l2);
 			if (!crossPoint) continue;
 
-			const transferCandidates = await findNearbyStopsWithLines(crossPoint, radiusM);
+			const transferCandidates = await findNearbyStopsWithLines(crossPoint, radiusM, budget);
 			const boardL1 = bestStopForLine(originStops, l1);
 			const alightL1 = bestStopForLine(transferCandidates, l1);
 			const boardL2 = bestStopForLine(transferCandidates, l2);
@@ -178,17 +228,16 @@ export async function planTrip(
 	destination: [number, number],
 	radiusM: number = DEFAULT_WALK_RADIUS_M
 ): Promise<{ options: TripOption[]; radiusUsed: number }> {
-	const originStops = await findNearbyStopsWithLines(origin, radiusM);
-	const destStops = await findNearbyStopsWithLines(destination, radiusM);
+	const budget = createFetchBudget();
+
+	const originStops = await findNearbyStopsWithLines(origin, radiusM, budget);
+	const destStops = await findNearbyStopsWithLines(destination, radiusM, budget);
 
 	let options = directOptions(originStops, destStops);
 
 	if (options.length === 0) {
-		options = await oneTransferOptions(originStops, destStops, radiusM);
+		options = await oneTransferOptions(originStops, destStops, radiusM, budget);
 	}
-
-	// 2 transbordos queda deliberadamente afuera de esta versión — ver
-	// nota en el mensaje de la sesión donde se agregó esto.
 
 	return { options: options.slice(0, MAX_RESULTS), radiusUsed: radiusM };
 }

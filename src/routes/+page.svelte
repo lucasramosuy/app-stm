@@ -37,6 +37,7 @@
 		stale: boolean;
 		lastUpdatedAt: number | null;
 		isDefault: boolean;
+		retryNotBefore: number | null;
 	}
 
 	interface TripPoint {
@@ -91,6 +92,13 @@
 		lines: []
 	});
 	let searchOpen = $state(false);
+	interface GeocodeResult {
+		label: string;
+		coordinates: [number, number];
+		approximate: boolean;
+	}
+	let geocodeResults = $state<GeocodeResult[]>([]);
+	let geocodeLoading = $state(false);
 
 	function updateUrl(line: string | null) {
 		if (typeof window === 'undefined') return;
@@ -162,7 +170,11 @@
 		const stale = res.headers.get('X-Data-Stale') === '1';
 		if (!res.ok) {
 			const errorData = await res.json().catch(() => ({}));
-			throw new Error(errorData.message || 'No se pudieron cargar los próximos buses');
+			const err = new Error(errorData.message || 'No se pudieron cargar los próximos buses');
+			if (typeof errorData.retryAfterMs === 'number') {
+				(err as Error & { retryAfterMs?: number }).retryAfterMs = errorData.retryAfterMs;
+			}
+			throw err;
 		}
 		const data: UpcomingBus[] = await res.json();
 		return { data, stale };
@@ -192,7 +204,8 @@
 			error: '',
 			stale: false,
 			lastUpdatedAt: null,
-			isDefault
+			isDefault,
+			retryNotBefore: null
 		};
 		selectedStops = [entry, ...selectedStops];
 		sheetOpen = true;
@@ -212,6 +225,25 @@
 			});
 
 			const lines = detail.lineas.join(',');
+
+			if (!lines) {
+				// La API de STM exige "lines" para upcomingbuses. Si
+				// llegamos acá sin ninguna, es porque el detalle vino del
+				// fallback (STM falló al traer el detalle real, se
+				// reconstruyó desde el listado general, que no trae
+				// líneas) — no tiene sentido pedirle a ese endpoint algo
+				// que ya sabemos que va a rechazar con 400.
+				patchStop(busstopId, {
+					detail,
+					upcoming: [],
+					stale: true,
+					loading: false,
+					error: 'No pudimos determinar qué líneas pasan por esta parada ahora mismo. Probá de nuevo en un momento.',
+					lastUpdatedAt: Date.now()
+				});
+				return;
+			}
+
 			const { data, stale } = await fetchUpcoming(busstopId, lines);
 
 			patchStop(busstopId, {
@@ -221,6 +253,7 @@
 				loading: false,
 				lastUpdatedAt: Date.now()
 			});
+
 		} catch (err) {
 			patchStop(busstopId, {
 				loading: false,
@@ -232,12 +265,18 @@
 	async function refreshStop(stop: StopSelectionState) {
 		if (!stop.detail) return;
 		if (document.visibilityState === 'hidden') return;
+		if (stop.retryNotBefore && Date.now() < stop.retryNotBefore) return;
+		const lines = stop.detail.lineas.join(',');
+		if (!lines) return; // sin líneas conocidas todavía; se reintenta si el usuario vuelve a seleccionar la parada
 		try {
-			const lines = stop.detail.lineas.join(',');
 			const { data, stale } = await fetchUpcoming(stop.busstopId, lines);
-			patchStop(stop.busstopId, { upcoming: data, stale, lastUpdatedAt: Date.now() });
+			patchStop(stop.busstopId, { upcoming: data, stale, lastUpdatedAt: Date.now(), retryNotBefore: null });
 		} catch (err) {
 			console.warn('[polling] no se pudo refrescar upcomingbuses', stop.busstopId, err);
+			const retryAfterMs = (err as Error & { retryAfterMs?: number }).retryAfterMs;
+			if (typeof retryAfterMs === 'number') {
+				patchStop(stop.busstopId, { retryNotBefore: Date.now() + retryAfterMs });
+			}
 		}
 	}
 
@@ -301,6 +340,16 @@
 			return;
 		}
 		addStop(stop.busstopId);
+	}
+
+	function pickGeocodeResult(result: GeocodeResult) {
+		searchOpen = false;
+		query = '';
+		if (pickingOrigin) {
+			setTripOrigin(result.label, result.coordinates);
+			return;
+		}
+		setTripDestination(result.label, result.coordinates);
 	}
 
 	function pickLineResult(line: string, isDefault = false) {
@@ -534,6 +583,7 @@
 
 		if (q.length < 2) {
 			searchResults = { stops: [], lines: [] };
+			geocodeResults = [];
 			searchOpen = false;
 			return;
 		}
@@ -543,6 +593,20 @@
 			try {
 				const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
 				if (res.ok) searchResults = await res.json();
+
+				const hasLocalResults =
+					searchResults.stops.length > 0 || searchResults.lines.length > 0;
+				if (!hasLocalResults && q.length >= 4) {
+					geocodeLoading = true;
+					try {
+						const geoRes = await fetch(`/api/geocode?q=${encodeURIComponent(q)}`);
+						if (geoRes.ok) geocodeResults = await geoRes.json();
+					} finally {
+						geocodeLoading = false;
+					}
+				} else {
+					geocodeResults = [];
+				}
 			} catch (err) {
 				console.warn('[search] falló la búsqueda', err);
 			}
@@ -653,7 +717,7 @@
 				</div>
 			{/if}
 
-			{#if searchOpen && (searchResults.stops.length > 0 || searchResults.lines.length > 0)}
+			{#if searchOpen && (searchResults.stops.length > 0 || searchResults.lines.length > 0 || geocodeResults.length > 0 || geocodeLoading)}
 				<div class="search-dropdown">
 					{#if searchResults.lines.length > 0}
 						<div class="search-section-label">Líneas</div>
@@ -694,6 +758,24 @@
 					<p class="search-empty">Sin resultados para "{query}"</p>
 				</div>
 			{/if}
+
+			{#if geocodeLoading}
+						<div class="search-section-label">Direcciones</div>
+						<p class="search-empty small">Buscando...</p>
+					{:else if geocodeResults.length > 0}
+						<div class="search-section-label">Direcciones</div>
+						{#each geocodeResults as result, i (i)}
+							<button class="search-result geocode-result" onclick={() => pickGeocodeResult(result)}>
+								<span>{result.label}</span>
+								{#if result.approximate}
+									<span class="approx-badge" title="Este punto agrupa varias numeraciones del mismo edificio en OpenStreetMap; puede no ser exacto para el número buscado.">
+										aprox.
+									</span>
+								{/if}
+							</button>
+						{/each}
+						<p class="geocode-attribution">Direcciones © colaboradores de OpenStreetMap</p>
+					{/if}
 		</div>
 	</div>
 
@@ -773,9 +855,7 @@
 					<div class="stack-card">
 						{#if stop.loading}
 							<p class="status">Cargando...</p>
-						{:else if stop.error}
-							<p class="status error">{stop.error}</p>
-						{:else if stop.detail}
+							{:else if stop.detail}
 							<div class="stop-header">
 								<div class="stop-header-title">
 									<button
@@ -826,7 +906,9 @@
 									</button>
 								</div>
 							</div>
-							{#if stop.upcoming.length === 0}
+							{#if stop.error}
+								<p class="status error">{stop.error}</p>
+							{:else if stop.upcoming.length === 0}
 								<p class="status">No hay buses acercándose ahora mismo.</p>
 							{:else}
 								{#each stop.upcoming as bus (bus.busId)}
@@ -839,6 +921,8 @@
 									/>
 								{/each}
 							{/if}
+							{:else if stop.error}
++							<p class="status error">{stop.error}</p>
 						{/if}
 					</div>
 				{/each}
@@ -1140,6 +1224,41 @@
 		text-align: center;
 		padding: var(--space-3);
 		margin: 0;
+	}
+
+	.search-empty.small {
+		padding: var(--space-2);
+		font-size: 12px;
+	}
+
+	.geocode-attribution {
+		font-size: 10px;
+		color: var(--color-text-secondary);
+		opacity: 0.6;
+		text-align: center;
+		margin: var(--space-2) 0 0;
+		padding-top: var(--space-2);
+		border-top: 1px solid var(--color-border);
+	}
+
+	.geocode-result {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-2);
+	}
+
+	.approx-badge {
+		flex-shrink: 0;
+		font-size: 10px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		color: var(--color-accent);
+		background: rgba(255, 201, 60, 0.12);
+		padding: 2px 6px;
+		border-radius: 999px;
+		cursor: help;
 	}
 
 	.selection-stack {
