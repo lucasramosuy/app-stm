@@ -117,6 +117,24 @@
 	// ícono+label de aeródromos.
 	const BASE_POI_LAYER_IDS = ['poi_r1', 'poi_r7', 'poi_r20', 'poi_transit', 'airport'];
 
+	// --- Animación de marcadores de buses ---
+	// Los buses no "saltan" de una posición a otra en cada update: se
+	// interpola cuadro a cuadro con requestAnimationFrame. La duración de
+	// cada tramo se calcula del tiempo real transcurrido desde el update
+	// anterior de ESE bus puntual (no un valor fijo), así se adapta sola
+	// tanto al polling de 8s (viewport/línea) como al de 20s que llega
+	// desde afuera en modo "stop".
+	const MIN_ANIM_MS = 3_000;
+	const MAX_ANIM_MS = 20_000;
+
+	// Si el bus real está más lejos que esto del trazado GTFS conocido
+	// (desvío, depósito, error de GPS), no lo "enganchamos" al trazado
+	// para ese tramo — mejor una línea recta puntual que una interpolación
+	// que lo arrastre por un camino que no está siguiendo. Valor en
+	// distancia-en-grados al cuadrado, igual que degDistSq: no es una
+	// distancia real en metros, solo sirve para comparar (~300m aprox).
+	const MAX_SNAP_DIST_SQ = 0.0027 * 0.0027;
+
 	let mapContainer: HTMLDivElement;
 	let map: MapLibreMap | undefined;
 	let mapReady = $state(false);
@@ -225,34 +243,295 @@
 		}
 	}
 
-	function syncBuses(list: LiveBus[]) {
-		if (!map) return;
-		const source = map.getSource(BUSES_SOURCE_ID) as GeoJSONSource | undefined;
-		if (!source) return;
+	// --- Trazados GTFS por línea, para animar los buses SOBRE el
+	// recorrido real en vez de en línea recta ---
+	// Reusa el mismo endpoint /api/lines/{line}/shape que ya usás para
+	// pintar el trazado de la línea filtrada. Acá lo usamos puramente
+	// como geometría de referencia para la animación, cacheado por línea
+	// en memoria del componente (no se vuelve a pedir mientras viva el
+	// mapa montado).
+	let shapeCache = new Map<string, number[][][] | null>();
+	let shapeFetchInFlight = new Map<string, Promise<void>>();
 
-		source.setData({
-			type: 'FeatureCollection',
-			features: list.map((bus) => ({
-				type: 'Feature',
-				id: bus.busId,
-				properties: {
-					busId: bus.busId,
-					line: bus.line,
-					origin: bus.origin,
-					destination: bus.destination,
-					subline: bus.subline,
-					special: bus.special,
-					company: bus.company,
-					speed: bus.speed,
-					access: bus.access,
-					thermalConfort: bus.thermalConfort,
-					emissions: bus.emissions
-				},
-				geometry: { type: 'Point', coordinates: bus.location.coordinates }
-			}))
+	function ensureShapeForLine(line: string) {
+		if (shapeCache.has(line) || shapeFetchInFlight.has(line)) return;
+
+		const promise = fetch(`/api/lines/${encodeURIComponent(line)}/shape`)
+			.then((res) => (res.ok ? res.json() : null))
+			.then((geojson: { features?: { geometry: { coordinates: number[][] } }[] } | null) => {
+				const shapes = geojson?.features?.map((f) => f.geometry.coordinates) ?? null;
+				shapeCache.set(line, shapes && shapes.length > 0 ? shapes : null);
+			})
+			.catch(() => {
+				shapeCache.set(line, null);
+			})
+			.finally(() => {
+				shapeFetchInFlight.delete(line);
+			});
+
+		shapeFetchInFlight.set(line, promise);
+	}
+
+	// --- Interpolación de buses ---
+
+	interface AnimatedBusState {
+		from: [number, number];
+		to: [number, number];
+		start: number; // performance.now()
+		duration: number; // ms; 0 = sin animación, aparece directo
+		properties: Record<string, unknown>;
+		// Si hay trazado GTFS disponible y el bus está razonablemente
+		// cerca de él, se anima a lo largo de estos vértices (parametrizado
+		// por distancia acumulada) en vez de en línea recta.
+		path?: [number, number][];
+		cumDist?: number[];
+		totalDist?: number;
+	}
+
+	let animatedBuses = new Map<number, AnimatedBusState>();
+	let busAnimationFrameId: number | null = null;
+	let prefersReducedMotion = false;
+
+	function lerp(a: number, b: number, t: number): number {
+		return a + (b - a) * t;
+	}
+
+	function easeOutQuad(t: number): number {
+		return t * (2 - t);
+	}
+
+	/** Distancia al cuadrado en grados — solo sirve para COMPARAR y
+	 * elegir el punto/variante más cercano, no es una distancia real en
+	 * metros. Alcanza para esto porque es puramente visual. */
+	function degDistSq(a: [number, number], b: [number, number]): number {
+		const dx = a[0] - b[0];
+		const dy = a[1] - b[1];
+		return dx * dx + dy * dy;
+	}
+
+	function nearestIndex(point: [number, number], coords: number[][]): { index: number; distSq: number } {
+		let bestIndex = 0;
+		let bestDist = Infinity;
+		coords.forEach((c, i) => {
+			const d = degDistSq(point, c as [number, number]);
+			if (d < bestDist) {
+				bestDist = d;
+				bestIndex = i;
+			}
+		});
+		return { index: bestIndex, distSq: bestDist };
+	}
+
+	/** Busca, entre las variantes de recorrido de una línea, el tramo del
+	 * trazado GTFS entre `from` y `to`. Si el bus está demasiado lejos de
+	 * cualquier variante conocida (desvío, depósito, GPS ruidoso), o no
+	 * hay shape cacheado todavía para esa línea, devuelve null — el
+	 * llamador cae de vuelta a línea recta para ese tramo puntual. */
+	function buildPathBetween(
+		line: string,
+		from: [number, number],
+		to: [number, number]
+	): { path: [number, number][]; cumDist: number[]; totalDist: number } | null {
+		const shapes = shapeCache.get(line);
+		if (!shapes || shapes.length === 0) return null;
+
+		let bestCoords: number[][] | null = null;
+		let bestScore = Infinity;
+		let bestFromIdx = 0;
+		let bestToIdx = 0;
+		let bestFromDist = Infinity;
+		let bestToDist = Infinity;
+
+		for (const coords of shapes) {
+			if (coords.length < 2) continue;
+			const nf = nearestIndex(from, coords);
+			const nt = nearestIndex(to, coords);
+			const score = nf.distSq + nt.distSq;
+			if (score < bestScore) {
+				bestScore = score;
+				bestCoords = coords;
+				bestFromIdx = nf.index;
+				bestToIdx = nt.index;
+				bestFromDist = nf.distSq;
+				bestToDist = nt.distSq;
+			}
+		}
+
+		if (!bestCoords) return null;
+		if (bestFromDist > MAX_SNAP_DIST_SQ || bestToDist > MAX_SNAP_DIST_SQ) return null;
+
+		let segment: number[][];
+		if (bestFromIdx <= bestToIdx) {
+			segment = bestCoords.slice(bestFromIdx, bestToIdx + 1);
+		} else {
+			segment = bestCoords.slice(bestToIdx, bestFromIdx + 1).slice().reverse();
+		}
+		if (segment.length < 2) return null;
+
+		// Los extremos se reemplazan por las coordenadas GPS reales — el
+		// punto más cercano del shape es una aproximación, no el punto
+		// exacto donde está el bus.
+		const path: [number, number][] = [
+			from,
+			...(segment.slice(1, -1) as [number, number][]),
+			to
+		];
+
+		const cumDist: number[] = [0];
+		for (let i = 1; i < path.length; i++) {
+			cumDist.push(cumDist[i - 1] + Math.sqrt(degDistSq(path[i - 1], path[i])));
+		}
+		const totalDist = cumDist[cumDist.length - 1];
+		if (totalDist === 0) return null;
+
+		return { path, cumDist, totalDist };
+	}
+
+	function positionAlongPath(
+		path: [number, number][],
+		cumDist: number[],
+		totalDist: number,
+		t: number
+	): [number, number] {
+		const targetDist = t * totalDist;
+		for (let i = 1; i < cumDist.length; i++) {
+			if (cumDist[i] >= targetDist) {
+				const segStart = cumDist[i - 1];
+				const segLen = cumDist[i] - segStart;
+				const segT = segLen === 0 ? 0 : (targetDist - segStart) / segLen;
+				const a = path[i - 1];
+				const b = path[i];
+				return [lerp(a[0], b[0], segT), lerp(a[1], b[1], segT)];
+			}
+		}
+		return path[path.length - 1];
+	}
+
+	function currentInterpolatedPosition(state: AnimatedBusState, now: number): [number, number] {
+		if (state.duration <= 0) return state.to;
+		const t = Math.min(1, (now - state.start) / state.duration);
+		const eased = easeOutQuad(t);
+
+		if (state.path && state.cumDist && state.totalDist) {
+			return positionAlongPath(state.path, state.cumDist, state.totalDist, eased);
+		}
+		return [lerp(state.from[0], state.to[0], eased), lerp(state.from[1], state.to[1], eased)];
+	}
+
+	function buildBusProperties(bus: LiveBus): Record<string, unknown> {
+		return {
+			busId: bus.busId,
+			line: bus.line,
+			origin: bus.origin,
+			destination: bus.destination,
+			subline: bus.subline,
+			special: bus.special,
+			company: bus.company,
+			speed: bus.speed,
+			access: bus.access,
+			thermalConfort: bus.thermalConfort,
+			emissions: bus.emissions
+		};
+	}
+
+	/** Pinta un cuadro con las posiciones interpoladas actuales.
+	 * Devuelve true si todavía queda algún bus en tránsito (para saber si
+	 * hace falta pedir otro frame). */
+	function renderBusesFrame(): boolean {
+		if (!map) return false;
+		const source = map.getSource(BUSES_SOURCE_ID) as GeoJSONSource | undefined;
+		if (!source) return false;
+
+		const now = performance.now();
+		let stillAnimating = false;
+
+		const features = Array.from(animatedBuses.entries()).map(([busId, state]) => {
+			if (state.duration > 0 && now - state.start < state.duration) stillAnimating = true;
+			return {
+				type: 'Feature' as const,
+				id: busId,
+				properties: state.properties,
+				geometry: { type: 'Point' as const, coordinates: currentInterpolatedPosition(state, now) }
+			};
 		});
 
+		source.setData({ type: 'FeatureCollection', features });
+		return stillAnimating;
+	}
+
+	function startBusAnimationLoop() {
+		if (busAnimationFrameId !== null) return; // ya está corriendo
+		const step = () => {
+			const stillAnimating = renderBusesFrame();
+			busAnimationFrameId = stillAnimating ? requestAnimationFrame(step) : null;
+		};
+		busAnimationFrameId = requestAnimationFrame(step);
+	}
+
+	function stopBusAnimationLoop() {
+		if (busAnimationFrameId !== null) {
+			cancelAnimationFrame(busAnimationFrameId);
+			busAnimationFrameId = null;
+		}
+	}
+
+	function syncBuses(list: LiveBus[]) {
+		if (!map) return;
+		const now = performance.now();
+		const seenIds = new Set<number>();
+
+		for (const bus of list) {
+			seenIds.add(bus.busId);
+			ensureShapeForLine(bus.line);
+
+			const target = bus.location.coordinates;
+			const properties = buildBusProperties(bus);
+			const existing = animatedBuses.get(bus.busId);
+
+			if (!existing || prefersReducedMotion) {
+				// Bus nuevo (o sin animación por preferencia del usuario):
+				// aparece directo en su posición, sin interpolar desde
+				// ningún lado.
+				animatedBuses.set(bus.busId, { from: target, to: target, start: now, duration: 0, properties });
+				continue;
+			}
+
+			// Arranca desde la posición interpolada ACTUAL (no desde el
+			// `to` ni el `from` del tramo anterior) — si un update nuevo
+			// llega antes de que termine la animación previa, esto evita
+			// un salto/parpadeo visual.
+			const currentPos = currentInterpolatedPosition(existing, now);
+			const elapsed = now - existing.start;
+			const duration = Math.min(MAX_ANIM_MS, Math.max(MIN_ANIM_MS, elapsed || BUSES_POLL_MS));
+			const pathInfo = buildPathBetween(bus.line, currentPos, target);
+
+			animatedBuses.set(bus.busId, {
+				from: currentPos,
+				to: target,
+				start: now,
+				duration,
+				properties,
+				path: pathInfo?.path,
+				cumDist: pathInfo?.cumDist,
+				totalDist: pathInfo?.totalDist
+			});
+		}
+
+		// Buses que ya no están en el nuevo listado (salieron del
+		// viewport, dejaron de servir la parada, etc.) desaparecen
+		// directo, sin animar la salida.
+		for (const id of animatedBuses.keys()) {
+			if (!seenIds.has(id)) animatedBuses.delete(id);
+		}
+
+		// Pinta un cuadro YA, sincrónicamente — así las features existen
+		// en el source ANTES de aplicar el feature-state de selección
+		// (mismo orden que la versión no-animada: setData y recién
+		// después el highlight), y no hay un frame de delay esperando al
+		// próximo rAF.
+		renderBusesFrame();
 		applySelectedBusHighlight();
+		startBusAnimationLoop();
 	}
 
 	function fitToBuses(list: LiveBus[]) {
@@ -339,28 +618,6 @@
 	}
 
 	// --- Trazado del viaje planificado ("Cómo llegar") ---
-
-	/** Distancia al cuadrado en grados — solo sirve para COMPARAR y
-	 * elegir el punto/variante más cercano, no es una distancia real en
-	 * metros. Alcanza para esto porque es puramente visual. */
-	function degDistSq(a: [number, number], b: [number, number]): number {
-		const dx = a[0] - b[0];
-		const dy = a[1] - b[1];
-		return dx * dx + dy * dy;
-	}
-
-	function nearestIndex(point: [number, number], coords: number[][]): { index: number; distSq: number } {
-		let bestIndex = 0;
-		let bestDist = Infinity;
-		coords.forEach((c, i) => {
-			const d = degDistSq(point, c as [number, number]);
-			if (d < bestDist) {
-				bestDist = d;
-				bestIndex = i;
-			}
-		});
-		return { index: bestIndex, distSq: bestDist };
-	}
 
 	/** Una línea puede tener varias variantes de recorrido (ida/vuelta,
 	 * ramales). Elige la que pasa más cerca de ambas paradas del tramo, y
@@ -671,6 +928,10 @@
 		let moveendTimeout: ReturnType<typeof setTimeout> | undefined;
 		let busesPollInterval: ReturnType<typeof setInterval> | undefined;
 
+		prefersReducedMotion =
+			typeof window !== 'undefined' &&
+			window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
 		(async () => {
 			let style: string | Awaited<ReturnType<typeof buildDarkStyle>> = STYLE_URL;
 			try {
@@ -967,11 +1228,13 @@
 		return () => {
 			clearTimeout(moveendTimeout);
 			clearInterval(busesPollInterval);
+			stopBusAnimationLoop();
 			if (watchId !== null) navigator.geolocation.clearWatch(watchId);
 		};
 	});
 
 	onDestroy(() => {
+		stopBusAnimationLoop();
 		if (watchId !== null) navigator.geolocation.clearWatch(watchId);
 		map?.remove();
 	});

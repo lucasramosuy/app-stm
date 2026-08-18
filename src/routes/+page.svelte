@@ -17,6 +17,13 @@
 	const RECENT_KEY = 'app_stm_recents';
 	const FAVORITES_KEY = 'app_stm_favorites';
 	const WELCOME_SEEN_KEY = 'app_stm_welcome_seen';
+	const NOTIFICATIONS_ENABLED_KEY = 'app_stm_notifications_enabled';
+
+	// Alertas in-app de "bus a punto de llegar": se dispara un toast la
+	// PRIMERA vez que un bus de alguna parada seleccionada cruza el
+	// umbral, no en cada poll mientras sigue bajando el ETA.
+	const ARRIVAL_ALERT_THRESHOLD_MIN = 3;
+	const ARRIVAL_ALERT_DURATION_MS = 6_000;
 
 	interface RecentItem {
 		id: string;
@@ -46,6 +53,13 @@
 		type: 'gps' | 'point';
 	}
 
+	interface ArrivalAlert {
+		id: string;
+		line: string;
+		destination: string;
+		etaMinutes: number;
+	}
+
 	let query = $state('');
 	let sheetOpen = $state(false);
 	let sidebarCollapsed = $state(false);
@@ -60,6 +74,20 @@
 	let isDefaultFavorite = $state(false);
 	let nowTick = $state(Date.now());
 	let showWelcome = $state(false);
+
+	// Alertas de llegada — el Set de ids ya alertados NO es reactivo a
+	// propósito (es solo bookkeeping interno, no debe disparar renders).
+	let arrivalAlerts = $state<ArrivalAlert[]>([]);
+	let alertedBusIds = new Set<number>();
+	let alertIdCounter = 0;
+
+	// Notificaciones del sistema — segunda mitad de las alertas de
+	// llegada. Solo funciona con la pestaña abierta (foreground o
+	// background), no requiere Service Worker "push" ni backend: usa la
+	// Notification API directo desde el mismo polling que ya existe.
+	let notificationsEnabled = $state(false);
+	let notificationBlockedHint = $state(false);
+	let notificationRequesting = $state(false);
 
 	// "Cómo llegar" — independiente de la pila de selección múltiple.
 	let tripDestination = $state<TripPoint | null>(null);
@@ -160,6 +188,148 @@
 		}
 	}
 
+	// --- Notificaciones del sistema ---
+
+	function persistNotificationsPref(value: boolean) {
+		try {
+			localStorage.setItem(NOTIFICATIONS_ENABLED_KEY, value ? '1' : '0');
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo guardar preferencia de notificaciones', e);
+		}
+	}
+
+	function loadNotificationsPref() {
+		try {
+			const raw = localStorage.getItem(NOTIFICATIONS_ENABLED_KEY);
+			// Solo lo activamos si el permiso del navegador SIGUE
+			// concedido — si el usuario lo revocó desde la configuración
+			// del sitio, no tiene sentido mostrar el toggle como activado
+			// cuando en realidad ya no va a disparar nada.
+			if (
+				raw === '1' &&
+				typeof window !== 'undefined' &&
+				'Notification' in window &&
+				Notification.permission === 'granted'
+			) {
+				notificationsEnabled = true;
+			}
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo leer preferencia de notificaciones', e);
+		}
+	}
+
+	function toggleNotifications() {
+		if (typeof window === 'undefined' || !('Notification' in window)) {
+			notificationBlockedHint = true;
+			return;
+		}
+
+		if (notificationsEnabled) {
+			notificationsEnabled = false;
+			persistNotificationsPref(false);
+			return;
+		}
+
+		if (Notification.permission === 'granted') {
+			notificationsEnabled = true;
+			persistNotificationsPref(true);
+			return;
+		}
+
+		if (Notification.permission === 'denied') {
+			// La API no permite volver a pedir permiso una vez denegado —
+			// el usuario tiene que cambiarlo a mano desde la
+			// configuración del sitio en el navegador.
+			notificationBlockedHint = true;
+			return;
+		}
+
+		notificationRequesting = true;
+		Notification.requestPermission()
+			.then((result) => {
+				if (result === 'granted') {
+					notificationsEnabled = true;
+					persistNotificationsPref(true);
+				} else {
+					notificationBlockedHint = true;
+				}
+			})
+			.finally(() => {
+				notificationRequesting = false;
+			});
+	}
+
+	function dismissNotificationBlockedHint() {
+		notificationBlockedHint = false;
+	}
+
+	/** Dispara la notificación nativa del SO — solo si el usuario la
+	 * activó Y la pestaña NO está en foco. Si está mirando la app, el
+	 * toast in-app ya cumple la misma función; duplicarlo sería ruido. */
+	function maybeShowSystemNotification(line: string, destination: string, etaMinutes: number) {
+		if (!notificationsEnabled) return;
+		if (typeof window === 'undefined' || !('Notification' in window)) return;
+		if (Notification.permission !== 'granted') return;
+		if (document.visibilityState === 'visible') return;
+
+		const minutesText = etaMinutes <= 0 ? 'menos de 1 min' : `${etaMinutes} min`;
+
+		try {
+			const notification = new Notification(`Línea ${line} está por llegar`, {
+				body: `Llega en ${minutesText} — ${destination}`,
+				tag: `bus-arrival-${line}-${Date.now()}`,
+				icon: '/web-app-manifest-192x192.png'
+			});
+			notification.onclick = () => {
+				window.focus();
+				notification.close();
+			};
+		} catch (err) {
+			console.warn('[notifications] no se pudo mostrar la notificación del sistema', err);
+		}
+	}
+
+	// --- Alertas de llegada ("bus a menos de X min") ---
+
+	function pushArrivalAlert(line: string, destination: string, etaMinutes: number) {
+		const id = `alert-${alertIdCounter++}`;
+		arrivalAlerts = [...arrivalAlerts, { id, line, destination, etaMinutes }];
+		setTimeout(() => {
+			arrivalAlerts = arrivalAlerts.filter((a) => a.id !== id);
+		}, ARRIVAL_ALERT_DURATION_MS);
+
+		maybeShowSystemNotification(line, destination, etaMinutes);
+	}
+
+	function dismissArrivalAlert(id: string) {
+		arrivalAlerts = arrivalAlerts.filter((a) => a.id !== id);
+	}
+
+	/** Revisa un listado de upcomingbuses recién llegado y dispara un
+	 * toast por cada bus que cruza el umbral por primera vez. No repite
+	 * el aviso mientras el bus se mantenga por debajo del umbral en
+	 * polls sucesivos — solo cuando entra de nuevo tras haber salido de
+	 * la lista (p. ej. otra vuelta del mismo recorrido). */
+	function checkArrivalAlerts(upcoming: UpcomingBus[]) {
+		const stillPresent = new Set<number>();
+
+		for (const bus of upcoming) {
+			stillPresent.add(bus.busId);
+			const minutes = etaToMinutes(bus.eta);
+			if (minutes < ARRIVAL_ALERT_THRESHOLD_MIN && !alertedBusIds.has(bus.busId)) {
+				alertedBusIds.add(bus.busId);
+				pushArrivalAlert(bus.line, bus.destination, minutes);
+			}
+		}
+
+		// Si un bus ya alertado desaparece del listado (llegó, pasó de
+		// largo, o simplemente ya no es "upcoming"), se libera para que
+		// pueda volver a alertar si reaparece más adelante.
+		for (const id of alertedBusIds) {
+			if (!stillPresent.has(id)) alertedBusIds.delete(id);
+		}
+	}
+
 	async function fetchUpcoming(
 		busstopId: number,
 		lines: string
@@ -254,6 +424,7 @@
 				lastUpdatedAt: Date.now()
 			});
 
+			checkArrivalAlerts(data);
 		} catch (err) {
 			patchStop(busstopId, {
 				loading: false,
@@ -271,6 +442,7 @@
 		try {
 			const { data, stale } = await fetchUpcoming(stop.busstopId, lines);
 			patchStop(stop.busstopId, { upcoming: data, stale, lastUpdatedAt: Date.now(), retryNotBefore: null });
+			checkArrivalAlerts(data);
 		} catch (err) {
 			console.warn('[polling] no se pudo refrescar upcomingbuses', stop.busstopId, err);
 			const retryAfterMs = (err as Error & { retryAfterMs?: number }).retryAfterMs;
@@ -512,6 +684,7 @@
 	onMount(() => {
 		loadRecents();
 		loadFavorites();
+		loadNotificationsPref();
 		const params = new URLSearchParams(window.location.search);
 		const stopParam = params.get('stop') || params.get('parada');
 		const lineParam = params.get('line') || params.get('linea');
@@ -665,7 +838,53 @@
 			</svg>
 		</button>
 
+		<button
+			class="notif-toggle-btn"
+			class:active={notificationsEnabled}
+			class:requesting={notificationRequesting}
+			onclick={toggleNotifications}
+			aria-pressed={notificationsEnabled}
+			aria-label={notificationsEnabled ? 'Desactivar avisos del sistema' : 'Activar avisos del sistema cuando un bus está por llegar'}
+			title={notificationsEnabled ? 'Avisos del sistema activados' : 'Activar avisos del sistema'}
+		>
+			<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+				<path d="M13.73 21a2 2 0 0 1-3.46 0" />
+			</svg>
+		</button>
+
 		<div class="search-col">
+			{#if notificationBlockedHint}
+				<div class="notif-blocked-hint">
+					Los avisos del sistema están bloqueados para este sitio. Para activarlos, cambiá el permiso de notificaciones desde la configuración del navegador.
+					<button class="notif-blocked-dismiss" onclick={dismissNotificationBlockedHint} aria-label="Cerrar aviso">×</button>
+				</div>
+			{/if}
+
+			{#if arrivalAlerts.length > 0}
+				<div class="arrival-alerts" aria-live="polite">
+					{#each arrivalAlerts as alert (alert.id)}
+						<div class="arrival-alert">
+							<span class="arrival-alert-dot"></span>
+							<span class="arrival-alert-text">
+								<strong>Línea {alert.line}</strong> llega en {alert.etaMinutes <= 0 ? 'menos de 1' : alert.etaMinutes} min
+								<span class="arrival-alert-destination">→ {alert.destination}</span>
+							</span>
+							<button
+								class="arrival-alert-close"
+								onclick={() => dismissArrivalAlert(alert.id)}
+								aria-label="Cerrar aviso"
+							>
+								<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+									<line x1="18" y1="6" x2="6" y2="18" />
+									<line x1="6" y1="6" x2="18" y2="18" />
+								</svg>
+							</button>
+						</div>
+					{/each}
+				</div>
+			{/if}
+
 			<SearchBar bind:value={query} />
 
 			{#if tripDestination}
@@ -964,6 +1183,117 @@
 		overflow: hidden;
 	}
 
+	.arrival-alerts {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-2);
+		margin-bottom: var(--space-2);
+	}
+
+	.arrival-alert {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		background: rgba(19, 27, 46, 0.97);
+		backdrop-filter: blur(12px);
+		-webkit-backdrop-filter: blur(12px);
+		border: 1px solid var(--color-live);
+		border-radius: var(--radius-md);
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+		padding: var(--space-3);
+		animation: arrival-alert-in 0.25s ease;
+	}
+
+	@keyframes arrival-alert-in {
+		from {
+			opacity: 0;
+			transform: translateY(-8px);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0);
+		}
+	}
+
+	.arrival-alert-dot {
+		flex-shrink: 0;
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--color-live);
+		box-shadow: 0 0 0 0 rgba(94, 234, 212, 0.5);
+		animation: pulse 2s infinite;
+	}
+
+	@keyframes pulse {
+		0% {
+			box-shadow: 0 0 0 0 rgba(94, 234, 212, 0.5);
+		}
+		70% {
+			box-shadow: 0 0 0 6px rgba(94, 234, 212, 0);
+		}
+		100% {
+			box-shadow: 0 0 0 0 rgba(94, 234, 212, 0);
+		}
+	}
+
+	.arrival-alert-text {
+		flex: 1;
+		min-width: 0;
+		font-size: 13px;
+		color: var(--color-text);
+		line-height: 1.4;
+	}
+
+	.arrival-alert-destination {
+		display: block;
+		font-size: 11px;
+		color: var(--color-text-secondary);
+	}
+
+	.arrival-alert-close {
+		flex-shrink: 0;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 22px;
+		height: 22px;
+		background: none;
+		border: none;
+		color: var(--color-text-secondary);
+		cursor: pointer;
+		border-radius: var(--radius-sm);
+	}
+
+	.arrival-alert-close:hover {
+		background: rgba(245, 246, 248, 0.08);
+		color: var(--color-text);
+	}
+
+	.notif-blocked-hint {
+		display: flex;
+		align-items: flex-start;
+		gap: var(--space-2);
+		background: #7f1d1d;
+		color: white;
+		font-size: 12px;
+		line-height: 1.4;
+		padding: var(--space-3);
+		border-radius: var(--radius-md);
+		margin-bottom: var(--space-2);
+	}
+
+	.notif-blocked-dismiss {
+		flex-shrink: 0;
+		background: none;
+		border: none;
+		color: white;
+		font-size: 16px;
+		line-height: 1;
+		cursor: pointer;
+		padding: 0;
+	}
+
 	.top-row {
 		position: absolute;
 		top: env(safe-area-inset-top, 0);
@@ -978,6 +1308,46 @@
 
 	.collapse-btn {
 		display: none;
+	}
+
+	.notif-toggle-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 36px;
+		height: 36px;
+		flex-shrink: 0;
+		background: var(--color-surface);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-sm);
+		color: var(--color-text-secondary);
+		cursor: pointer;
+		transition:
+			color 0.15s ease,
+			border-color 0.15s ease;
+	}
+
+	.notif-toggle-btn:hover {
+		color: var(--color-text);
+	}
+
+	.notif-toggle-btn.active {
+		color: var(--color-live);
+		border-color: var(--color-live);
+	}
+
+	.notif-toggle-btn.requesting {
+		animation: locate-pulse 1.1s ease-in-out infinite;
+	}
+
+	@keyframes locate-pulse {
+		0%,
+		100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.4;
+		}
 	}
 
 	.search-col {
