@@ -1,4 +1,5 @@
 <script lang="ts">
+	import * as Sentry from '@sentry/sveltekit';
 	import { onMount } from 'svelte';
 	import BusMap, { type MapBusSelection } from '$lib/components/BusMap.svelte';
 	import SearchBar from '$lib/components/SearchBar.svelte';
@@ -11,6 +12,8 @@
 	import TripResultsCard from '$lib/components/TripResultsCard.svelte';
 	import { etaToMinutes, type BusStopDetail, type UpcomingBus } from '$lib/types/stm';
 	import type { TripOption } from '$lib/types/trip';
+	import { initClarity } from '$lib/analytics/clarity';
+	import { env } from '$env/dynamic/public';
 
 	const POLL_INTERVAL_MS = 20_000;
 	const SEARCH_DEBOUNCE_MS = 300;
@@ -445,6 +448,7 @@
 			checkArrivalAlerts(data);
 		} catch (err) {
 			console.warn('[polling] no se pudo refrescar upcomingbuses', stop.busstopId, err);
+			Sentry.captureException(err, { level: 'warning', tags: { source: 'polling.upcoming-buses' } });
 			const retryAfterMs = (err as Error & { retryAfterMs?: number }).retryAfterMs;
 			if (typeof retryAfterMs === 'number') {
 				patchStop(stop.busstopId, { retryNotBefore: Date.now() + retryAfterMs });
@@ -685,7 +689,22 @@
 		loadRecents();
 		loadFavorites();
 		loadNotificationsPref();
+
+		// Si ya vio el aviso de privacidad en una visita anterior
+		// (WELCOME_SEEN_KEY), arrancamos Clarity de una. Si es la
+		// primera vez, se dispara recién en dismissWelcome() — no antes
+		// de mostrarle el aviso.
+		try {
+			if (localStorage.getItem(WELCOME_SEEN_KEY)) {
+				initClarity(env.PUBLIC_CLARITY_ID);
+			}
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo leer welcome_seen para Clarity', e);
+		}
+
 		const params = new URLSearchParams(window.location.search);
+
+
 		const stopParam = params.get('stop') || params.get('parada');
 		const lineParam = params.get('line') || params.get('linea');
 
@@ -721,6 +740,7 @@
 		} catch (e) {
 			console.warn('[LocalStorage] no se pudo guardar welcome_seen', e);
 		}
+		initClarity(env.PUBLIC_CLARITY_ID);
 	}
 
 	$effect(() => {
@@ -782,6 +802,7 @@
 				}
 			} catch (err) {
 				console.warn('[search] falló la búsqueda', err);
+				Sentry.captureException(err, { level: 'warning', tags: { source: 'search' } });
 			}
 		}, SEARCH_DEBOUNCE_MS);
 

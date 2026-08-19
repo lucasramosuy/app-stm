@@ -3,6 +3,8 @@ import { getStmRateLimitCooldownMs } from './stmApi';
 import { getRouteShape } from './routeShapes';
 import { haversineDistance, pointToPolylineMeters, polylineToPolylineMeters } from './geo';
 import type { TripOption } from '$lib/types/trip';
+import * as Sentry from '@sentry/sveltekit';
+import { shouldReport } from '$lib/sentryRateLimit';
 
 export const DEFAULT_WALK_RADIUS_M = 500;
 
@@ -88,8 +90,15 @@ async function findNearbyStopsWithLines(
 			};
 			budget.cache.set(stop.busstopId, withLines);
 			results.push(withLines);
-		} catch {
+		} catch(err) {
 			budget.cache.set(stop.busstopId, null);
+			if (shouldReport('tripplanner.stop-detail')) {
+				Sentry.captureException(err, {
+					level: 'warning',
+					tags: { source: 'tripplanner.stop-detail' },
+					extra: { busstopId: stop.busstopId }
+				});
+			}
 		}
 	}
 	return results;

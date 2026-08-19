@@ -1,19 +1,25 @@
+import { sentrySvelteKit } from '@sentry/sveltekit';
 import adapter from '@sveltejs/adapter-netlify';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
 	plugins: [
+		sentrySvelteKit({
+			// Solo sube sourcemaps si hay auth token (dev local sin token
+			// no rompe el build, solo se salta este paso).
+			autoUploadSourceMaps: !!process.env.SENTRY_AUTH_TOKEN,
+			sourceMapsUploadOptions: {
+				org: process.env.SENTRY_ORG,
+				project: process.env.SENTRY_PROJECT,
+				authToken: process.env.SENTRY_AUTH_TOKEN
+			}
+		}),
 		sveltekit({
 			compilerOptions: {
-				// Force runes mode for the project, except for libraries. Can be removed in svelte 6.
 				runes: ({ filename }) =>
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true
 			},
-
-			// Deploy target: Netlify. Ver /home/claude/mvd-bus README para el porqué
-			// (necesitamos runtime Node persistente para el cache del token OAuth,
-			// no edge/Workers).
 			adapter: adapter()
 		})
 	]

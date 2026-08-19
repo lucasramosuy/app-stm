@@ -57,6 +57,11 @@
 		</ul>
 
 		<button class="start-btn" onclick={() => onClose?.()}>Entendido</button>
+
+		<p class="privacy-note">
+			Usamos datos de uso para mejorar la app.
+			<a href="/privacidad">Más información</a>
+		</p>
 	</div>
 </div>
 
@@ -174,6 +179,18 @@
 	.start-btn:focus-visible {
 		outline: 2px solid var(--color-live);
 		outline-offset: 2px;
+	}
+
+	.privacy-note {
+		margin: var(--space-3) 0 0;
+		font-size: 11px;
+		color: var(--color-text-secondary);
+		line-height: 1.5;
+	}
+
+	.privacy-note a {
+		color: var(--color-live);
+		text-decoration: underline;
 	}
 
 	@keyframes fade-in {

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import * as Sentry from '@sentry/sveltekit';
 	import { onMount, onDestroy } from 'svelte';
 	import { Map as MapLibreMap, NavigationControl, setWorkerUrl } from 'maplibre-gl';
 	import type { GeoJSONSource, MapGeoJSONFeature } from 'maplibre-gl';
@@ -7,6 +8,7 @@
 	import { buildDarkStyle } from '$lib/map/darkStyle';
 	import type { UpcomingBus } from '$lib/types/stm';
 	import type { TripOption } from '$lib/types/trip';
+	import { shouldReport } from '$lib/sentryRateLimit';
 
 	interface NearbyStop {
 		busstopId: number;
@@ -240,6 +242,7 @@
 			}
 		} catch (err) {
 			console.warn('[BusMap] no se pudieron cargar paradas cercanas', err);
+			Sentry.captureException(err, { level: 'warning', tags: { source: 'busmap.nearby-stops' } });
 		}
 	}
 
@@ -575,6 +578,7 @@
 			}
 		} catch (err) {
 			console.warn('[BusMap] no se pudieron cargar buses cercanos', err);
+			Sentry.captureException(err, { level: 'warning', tags: { source: 'busmap.buses-viewport' } });
 		}
 	}
 
@@ -591,6 +595,9 @@
 			}
 		} catch (err) {
 			console.warn('[BusMap] no se pudieron cargar buses de la línea', err);
+			if (shouldReport('busmap.buses-by-line')) {
+        	Sentry.captureException(err, { level: 'warning', tags: { source: 'busmap.buses-by-line' } });
+    		}
 		}
 	}
 
@@ -1214,6 +1221,13 @@
 			map.on('sourcedata', (e) => {
 				if (e.isSourceLoaded && !tilesLoaded) {
 					tilesLoaded = true;
+					// Si el aviso de red seguía puesto (tiles tardaron más de
+					// 6s pero terminaron cargando), lo limpiamos — el
+					// problema ya no existe. No tocamos debugMessage si es
+					// un error real de MapLibre (ver handler 'error' abajo).
+					if (debugMessage?.startsWith('El mapa no recibió datos')) {
+						debugMessage = null;
+					}
 				}
 			});
 
@@ -1269,7 +1283,10 @@
 {/if}
 
 {#if debugMessage}
-	<div class="debug-banner">{debugMessage}</div>
+	<div class="debug-banner">
+		<span>{debugMessage}</span>
+		<button class="debug-dismiss" onclick={() => (debugMessage = null)} aria-label="Cerrar aviso">×</button>
+	</div>
 {/if}
 
 <style>
@@ -1375,7 +1392,7 @@
 		padding: 0;
 	}
 
-	.debug-banner {
+		.debug-banner {
 		position: absolute;
 		bottom: var(--space-4);
 		left: var(--space-4);
@@ -1387,5 +1404,19 @@
 		padding: var(--space-3);
 		border-radius: var(--radius-sm);
 		max-width: 480px;
+		display: flex;
+		align-items: flex-start;
+		gap: var(--space-2);
+	}
+
+	.debug-dismiss {
+		flex-shrink: 0;
+		background: none;
+		border: none;
+		color: white;
+		font-size: 16px;
+		line-height: 1;
+		cursor: pointer;
+		padding: 0;
 	}
 </style>

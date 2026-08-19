@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
+	import FeedbackButton from './FeedbackButton.svelte';
 
 	const DESKTOP_MQ = '(min-width: 900px)';
 	const PEEK_HEIGHT = 56;
@@ -194,6 +195,10 @@
 			<p class="empty">Tocá una parada u ómnibus en el mapa para ver el detalle acá.</p>
 		{/if}
 	</div>
+
+	<div class="sheet-footer">
+		<FeedbackButton />
+	</div>
 </div>
 
 <style>
@@ -299,6 +304,13 @@
 		overscroll-behavior: contain;
 		-webkit-overflow-scrolling: touch;
 		padding-top: var(--space-1);
+	}
+
+	.sheet-footer {
+		flex-shrink: 0;
+		padding-top: var(--space-3);
+		margin-top: var(--space-2);
+		border-top: 1px solid var(--color-border);
 	}
 
 	.empty {
