@@ -14,6 +14,20 @@
 	import RoutinesSection from '$lib/components/RoutinesSection.svelte';
 	import SaveRoutineCard from '$lib/components/SaveRoutineCard.svelte';
 	import ShareTripCard from '$lib/components/ShareTripCard.svelte';
+	import ActiveTripCard from '$lib/components/ActiveTripCard.svelte';
+	import {
+		TRIP_ALERTS_ENABLED_KEY,
+		TRANSFER_ALERT_RADIUS_M,
+		ALIGHT_ALERT_RADIUS_M,
+		NEXT_LEG_REBASE_RADIUS_M,
+		ETA_CHANGE_THRESHOLD_MIN,
+		ETA_ALERT_MAX_DIST_TO_BOARD_M,
+		distanceMeters,
+		formatClock,
+		formatDistance,
+		type ActiveTrip,
+		type TripAlert
+	} from '$lib/tripAlerts';
 	import {
 		loadRoutines,
 		saveRoutines,
@@ -577,6 +591,7 @@
 	}
 
 	function clearTripDestination() {
+		endTrip();
 		tripDestination = null;
 		tripOrigin = null;
 		pickingOrigin = false;
@@ -586,6 +601,7 @@
 	}
 
 	function clearTripOrigin() {
+		endTrip();
 		tripOrigin = null;
 		pickingOrigin = false;
 		originError = null;
@@ -674,6 +690,7 @@
 
 	async function searchRoute() {
 		if (!tripOrigin || !tripDestination) return;
+		endTrip();
 		tripLoading = true;
 		tripSearchError = null;
 		tripOptions = null;
@@ -774,10 +791,252 @@
 		saveRoutineOpen = false;
 	}
 
+	// --- Viaje activo + avisos del viaje ---
+	// El usuario arranca un viaje desde los resultados de "cómo llegar".
+	// Los avisos (opt-in, preferencia recordada en el dispositivo) son
+	// tres: cambio de ETA (polling de upcomingbuses, sin GPS), transbordo
+	// y bajada (GPS del teléfono, solo mientras el viaje está activo).
+	let activeTrip = $state<ActiveTrip | null>(null);
+	let currentLegIndex = $state(0);
+	let tripAlertsEnabled = $state(false);
+	let tripAlerts = $state<TripAlert[]>([]);
+	let tripGpsDenied = $state(false);
+	let tripEtaMin = $state<number | null>(null);
+	let tripAlertIdCounter = 0;
+	// Bookkeeping no reactivo (igual que alertedBusIds): no debe
+	// disparar renders.
+	let lastTripEtaMin: number | null = null;
+	let lastUserPosition: [number, number] | null = null;
+	let tripGpsWatchId: number | null = null;
+	let tripEtaRetryNotBefore: number | null = null;
+	const firedProximityAlerts = new Set<string>();
+
+	function loadTripAlertsPref() {
+		try {
+			tripAlertsEnabled = localStorage.getItem(TRIP_ALERTS_ENABLED_KEY) === '1';
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo leer preferencia de avisos de viaje', e);
+		}
+	}
+
+	function persistTripAlertsPref(value: boolean) {
+		try {
+			localStorage.setItem(TRIP_ALERTS_ENABLED_KEY, value ? '1' : '0');
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo guardar preferencia de avisos de viaje', e);
+		}
+	}
+
+	function startTrip() {
+		if (!tripOrigin || !tripDestination || !tripOptions || tripOptions.length === 0) return;
+		activeTrip = {
+			option: tripOptions[0],
+			originLabel: tripOrigin.label,
+			destLabel: tripDestination.label,
+			startedAt: Date.now()
+		};
+		currentLegIndex = 0;
+		tripAlerts = [];
+		tripEtaMin = null;
+		lastTripEtaMin = null;
+		tripEtaRetryNotBefore = null;
+		firedProximityAlerts.clear();
+		saveRoutineOpen = false;
+		shareUrl = null;
+		sheetOpen = true;
+		if (tripAlertsEnabled) startTripGpsWatch();
+		refreshTripEta();
+	}
+
+	function endTrip() {
+		if (!activeTrip) return;
+		activeTrip = null;
+		currentLegIndex = 0;
+		tripAlerts = [];
+		tripEtaMin = null;
+		lastTripEtaMin = null;
+		tripEtaRetryNotBefore = null;
+		firedProximityAlerts.clear();
+		stopTripGpsWatch();
+	}
+
+	function toggleTripAlerts() {
+		tripAlertsEnabled = !tripAlertsEnabled;
+		persistTripAlertsPref(tripAlertsEnabled);
+		if (tripAlertsEnabled) {
+			if (activeTrip) startTripGpsWatch();
+		} else {
+			stopTripGpsWatch();
+		}
+	}
+
+	function startTripGpsWatch() {
+		if (typeof window === 'undefined' || !('geolocation' in navigator)) {
+			tripGpsDenied = true;
+			return;
+		}
+		if (tripGpsWatchId !== null) return;
+		tripGpsDenied = false;
+		tripGpsWatchId = navigator.geolocation.watchPosition(
+			(pos) => {
+				tripGpsDenied = false;
+				handleTripPosition([pos.coords.longitude, pos.coords.latitude]);
+			},
+			() => {
+				tripGpsDenied = true;
+			},
+			{ enableHighAccuracy: true, timeout: 15_000, maximumAge: 5_000 }
+		);
+	}
+
+	function stopTripGpsWatch() {
+		if (tripGpsWatchId !== null && typeof navigator !== 'undefined' && 'geolocation' in navigator) {
+			navigator.geolocation.clearWatch(tripGpsWatchId);
+		}
+		tripGpsWatchId = null;
+	}
+
+	/** Cada fix de GPS durante un viaje activo: avanza el tramo actual si
+	 * el usuario ya está en la parada de subida del siguiente, y dispara
+	 * los avisos de transbordo (~400 m) y bajada (~300 m), una sola vez
+	 * cada uno. */
+	function handleTripPosition(coords: [number, number]) {
+		lastUserPosition = coords;
+		if (!activeTrip || !tripAlertsEnabled) return;
+		const legs = activeTrip.option.legs;
+
+		const leg = legs[currentLegIndex];
+		const distToAlight = distanceMeters(coords, leg.alightStop.coordinates);
+
+		// Primero los avisos del tramo actual: si el usuario ya está EN
+		// la parada de transbordo, el aviso de "preparate para bajar" es
+		// justamente el que tiene que sonar antes de pasar al tramo
+		// siguiente.
+		if (currentLegIndex < legs.length - 1) {
+			const key = `transfer-${currentLegIndex}`;
+			if (distToAlight <= TRANSFER_ALERT_RADIUS_M && !firedProximityAlerts.has(key)) {
+				firedProximityAlerts.add(key);
+				fireTripAlert({
+					kind: 'transfer',
+					title: 'Preparate para bajar',
+					body: `Transbordás a la línea ${legs[currentLegIndex + 1].line} en ${leg.alightStop.label} (a unos ${formatDistance(distToAlight)}).`
+				});
+			}
+		} else if (distToAlight <= ALIGHT_ALERT_RADIUS_M && !firedProximityAlerts.has('alight')) {
+			firedProximityAlerts.add('alight');
+			fireTripAlert({
+				kind: 'alight',
+				title: 'Bajate en la próxima parada',
+				body: `${leg.alightStop.label} — de ahí son ${formatDistance(activeTrip.option.walkFromLastStopM)} a pie hasta ${activeTrip.destLabel}.`
+			});
+		}
+
+		// Después, el cambio de tramo: el usuario ya llegó a la parada
+		// de subida del tramo siguiente.
+		if (
+			currentLegIndex < legs.length - 1 &&
+			distanceMeters(coords, legs[currentLegIndex + 1].boardStop.coordinates) <=
+				NEXT_LEG_REBASE_RADIUS_M
+		) {
+			currentLegIndex += 1;
+			lastTripEtaMin = null;
+			// El ETA del tramo anterior no le sirve al nuevo: se limpia y
+			// se pide el de la parada de subida del tramo actual.
+			tripEtaMin = null;
+			refreshTripEta();
+		}
+	}
+
+	function fireTripAlert(alert: Omit<TripAlert, 'id'>) {
+		const id = `trip-alert-${tripAlertIdCounter++}`;
+		// Un solo aviso por tipo: el nuevo reemplaza al anterior del
+		// mismo tipo en vez de apilarse.
+		tripAlerts = [{ id, ...alert }, ...tripAlerts.filter((a) => a.kind !== alert.kind)];
+		showTripSystemNotification(alert.title, alert.body);
+	}
+
+	function dismissTripAlert(id: string) {
+		tripAlerts = tripAlerts.filter((a) => a.id !== id);
+	}
+
+	/** Misma política que los avisos de llegada: notificación del SO solo
+	 * si el usuario activó los avisos del sistema y la pestaña no está en
+	 * foco (en primer plano alcanza con la tarjeta in-app). */
+	function showTripSystemNotification(title: string, body: string) {
+		if (!notificationsEnabled) return;
+		if (typeof window === 'undefined' || !('Notification' in window)) return;
+		if (Notification.permission !== 'granted') return;
+		if (document.visibilityState === 'visible') return;
+
+		try {
+			const notification = new Notification(title, {
+				body,
+				tag: `trip-alert-${Date.now()}`,
+				icon: '/web-app-manifest-192x192.png'
+			});
+			notification.onclick = () => {
+				window.focus();
+				notification.close();
+			};
+		} catch (err) {
+			console.warn('[notifications] no se pudo mostrar el aviso de viaje del sistema', err);
+		}
+	}
+
+	/** ETA del próximo bus del tramo actual en su parada de subida. El
+	 * aviso de "cambio de ETA" salta cuando el valor se mueve ±2 min
+	 * entre polls, y solo mientras el usuario sigue cerca de la parada
+	 * (si ya va arriba del bus, el ETA de la parada ya no le sirve). */
+	async function refreshTripEta() {
+		if (!activeTrip) return;
+		if (document.visibilityState === 'hidden') return;
+		if (tripEtaRetryNotBefore && Date.now() < tripEtaRetryNotBefore) return;
+		const legs = activeTrip.option.legs;
+		const leg = legs[Math.min(currentLegIndex, legs.length - 1)];
+
+		try {
+			const { data } = await fetchUpcoming(leg.boardStop.busstopId, leg.line);
+			const next = data
+				.filter((b) => b.line === leg.line)
+				.sort((a, b) => etaToMinutes(a.eta) - etaToMinutes(b.eta))[0];
+			if (!next) {
+				tripEtaMin = null;
+				return;
+			}
+			const eta = etaToMinutes(next.eta);
+			tripEtaMin = eta;
+			tripEtaRetryNotBefore = null;
+
+			if (tripAlertsEnabled && lastTripEtaMin !== null) {
+				const delta = eta - lastTripEtaMin;
+				const nearBoard = lastUserPosition
+					? distanceMeters(lastUserPosition, leg.boardStop.coordinates) <=
+						ETA_ALERT_MAX_DIST_TO_BOARD_M
+					: true;
+				if (Math.abs(delta) >= ETA_CHANGE_THRESHOLD_MIN && nearBoard) {
+					fireTripAlert({
+						kind: 'eta',
+						title: `Tu ${leg.line} llega ${formatClock(Date.now() + eta * 60_000)}`,
+						body: `${Math.abs(delta)} min más ${delta > 0 ? 'tarde' : 'temprano'} que antes · ${leg.boardStop.label}`
+					});
+				}
+			}
+			lastTripEtaMin = eta;
+		} catch (err) {
+			console.warn('[polling] no se pudo refrescar el ETA del viaje', err);
+			Sentry.captureException(err, { level: 'warning', tags: { source: 'polling.trip-eta' } });
+			const retryAfterMs = (err as Error & { retryAfterMs?: number }).retryAfterMs;
+			if (typeof retryAfterMs === 'number') {
+				tripEtaRetryNotBefore = Date.now() + retryAfterMs;
+			}
+		}
+	}
+
 	onMount(() => {
 		loadRecents();
 		loadFavorites();
 		loadNotificationsPref();
+		loadTripAlertsPref();
 		routines = loadRoutines();
 
 		// Si ya vio el aviso de privacidad en una visita anterior
@@ -897,6 +1156,24 @@
 		}, SEARCH_DEBOUNCE_MS);
 
 		return () => clearTimeout(timeout);
+	});
+
+	$effect(() => {
+		if (!activeTrip) return;
+		// Se re-crea al cambiar de tramo para que el primer poll del
+		// tramo nuevo salga enseguida.
+		currentLegIndex;
+
+		const interval = setInterval(refreshTripEta, POLL_INTERVAL_MS);
+		const handleVisibility = () => {
+			if (document.visibilityState === 'visible') refreshTripEta();
+		};
+		document.addEventListener('visibilitychange', handleVisibility);
+
+		return () => {
+			clearInterval(interval);
+			document.removeEventListener('visibilitychange', handleVisibility);
+		};
 	});
 
 	const selectedStopIds = $derived(selectedStops.map((s) => s.busstopId));
@@ -1110,7 +1387,28 @@
 	</div>
 
 	<BottomSheet open={sheetOpen} bind:collapsed={sidebarCollapsed}>
-		{#if tripLoading || tripSearchError || tripOptions !== null}
+		{#if activeTrip}
+			<ActiveTripCard
+				destLabel={activeTrip.destLabel}
+				legs={activeTrip.option.legs}
+				currentLeg={currentLegIndex}
+				alerts={tripAlerts}
+				alertsEnabled={tripAlertsEnabled}
+				gpsDenied={tripGpsDenied}
+				etaMin={tripEtaMin}
+				boardLabel={activeTrip.option.legs[Math.min(currentLegIndex, activeTrip.option.legs.length - 1)]
+					.boardStop.label}
+				walkFinalM={activeTrip.option.walkFromLastStopM}
+				{nowTick}
+				onToggleAlerts={toggleTripAlerts}
+				onDismissAlert={dismissTripAlert}
+				onShare={openShareTrip}
+				onEnd={endTrip}
+			/>
+			{#if shareUrl}
+				<ShareTripCard url={shareUrl} onClose={() => (shareUrl = null)} />
+			{/if}
+		{:else if tripLoading || tripSearchError || tripOptions !== null}
 			<TripResultsCard
 				loading={tripLoading}
 				error={tripSearchError}
@@ -1118,6 +1416,7 @@
 				onClose={closeTripResults}
 				onSaveRoutine={tripOrigin && tripDestination ? openSaveRoutine : undefined}
 				onShareTrip={tripOrigin && tripDestination ? openShareTrip : undefined}
+				onStartTrip={tripOrigin && tripDestination ? startTrip : undefined}
 			/>
 			{#if saveRoutineOpen && tripOrigin && tripDestination}
 				<SaveRoutineCard
