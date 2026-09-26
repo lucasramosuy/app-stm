@@ -97,12 +97,12 @@
 	const SHAPE_GLOW_LAYER_ID = 'route-shape-glow';
 	const SHAPE_LINE_LAYER_ID = 'route-shape-line';
 
-	// Violeta para el trazado de "filtro de línea" (toda la ciudad).
+	// Violeta para el trazado de "filtro de lÃ­nea" (toda la ciudad).
 	const ROUTE_SHAPE_COLOR = '#a78bfa';
 
-	// Capas del viaje planificado ("Cómo llegar") — color distinto
-	// (celeste) para no confundirse con el violeta del filtro de línea,
-	// que puede coexistir en el mismo mapa en teoría.
+	// Capas del viaje planificado ("CÃ³mo llegar") â color distinto
+	// (celeste) para no confundirse con el violeta del filtro de lÃ­nea,
+	// que puede coexistir en el mismo mapa en teorÃ­a.
 	const TRIP_WALK_SOURCE_ID = 'trip-walk';
 	const TRIP_WALK_LAYER_ID = 'trip-walk-line';
 	const TRIP_ROUTE_SOURCE_ID = 'trip-route';
@@ -112,45 +112,47 @@
 	const TRIP_ROUTE_COLOR = '#38bdf8';
 	const TRIP_WALK_COLOR = '#9aa3b2';
 
-	// Capas de POI del estilo base Liberty (OpenFreeMap) — no son
+	// Capas de POI del estilo base Liberty (OpenFreeMap) â no son
 	// nuestras, ya vienen en el JSON del estilo. poi_r1/r7/r20 son
-	// comercios y amenities genéricos (por rango de importancia),
-	// poi_transit cubre íconos de aeropuerto/bus/tren, airport es el
-	// ícono+label de aeródromos.
+	// comercios y amenities genÃ©ricos (por rango de importancia),
+	// poi_transit cubre Ã­conos de aeropuerto/bus/tren, airport es el
+	// Ã­cono+label de aerÃ³dromos.
 	const BASE_POI_LAYER_IDS = ['poi_r1', 'poi_r7', 'poi_r20', 'poi_transit', 'airport'];
 
-	// --- Animación de marcadores de buses ---
-	// Los buses no "saltan" de una posición a otra en cada update: se
-	// interpola cuadro a cuadro con requestAnimationFrame. La duración de
-	// cada tramo se calcula del tiempo real transcurrido desde el update
-	// anterior de ESE bus puntual (no un valor fijo), así se adapta sola
-	// tanto al polling de 8s (viewport/línea) como al de 20s que llega
-	// desde afuera en modo "stop".
-	const MIN_ANIM_MS = 3_000;
+	// --- AnimaciÃ³n de marcadores de buses ---
+	// Los buses no "saltan" de una posiciÃ³n a otra en cada update: se
+	// interpola cuadro a cuadro con requestAnimationFrame. La duraciÃ³n de
+	// cada tramo es el tiempo real transcurrido desde el update anterior
+	// de ESE bus puntual (no un valor fijo) y la interpolaciÃ³n es LINEAL:
+	// el bus se mueve a la velocidad promedio real del tramo, pareja de
+	// punta a punta. (Antes se aplicaba un easing ease-out: cada tramo
+	// arrancaba rÃ¡pido y terminaba arrastrÃ¡ndose, y eso se percibÃ­a como
+	// buses que "a veces van rÃ¡pido, a veces lento".)
+	const MIN_ANIM_MS = 1_500;
 	const MAX_ANIM_MS = 20_000;
 
-	// Si el bus real está más lejos que esto del trazado GTFS conocido
-	// (desvío, depósito, error de GPS), no lo "enganchamos" al trazado
-	// para ese tramo — mejor una línea recta puntual que una interpolación
-	// que lo arrastre por un camino que no está siguiendo. Valor en
+	// Si el bus real estÃ¡ mÃ¡s lejos que esto del trazado GTFS conocido
+	// (desvÃ­o, depÃ³sito, error de GPS), no lo "enganchamos" al trazado
+	// para ese tramo â mejor una lÃ­nea recta puntual que una interpolaciÃ³n
+	// que lo arrastre por un camino que no estÃ¡ siguiendo. Valor en
 	// distancia-en-grados al cuadrado, igual que degDistSq: no es una
 	// distancia real en metros, solo sirve para comparar (~300m aprox).
 	const MAX_SNAP_DIST_SQ = 0.0027 * 0.0027;
 
-	// Anti "buses voladores": la posición que reporta STM a veces salta
+	// Anti "buses voladores": la posiciÃ³n que reporta STM a veces salta
 	// (GPS viejo que se actualiza de golpe, ruido, unidad que cambia de
-	// recorrido). Sin un límite, un salto de kilómetros se animaba
-	// durante hasta MAX_ANIM_MS y el bus se veía cruzar la ciudad
+	// recorrido). Sin un lÃ­mite, un salto de kilÃ³metros se animaba
+	// durante hasta MAX_ANIM_MS y el bus se veÃ­a cruzar la ciudad
 	// volando. Reglas:
-	// - Saltos más largos que MAX_ANIM_DIST_M no se animan: el bus
-	//   aparece directo en la posición nueva.
-	// - Si la velocidad implícita del tramo supera lo plausible para un
-	//   ómnibus urbano, tampoco se anima (cubre saltos medianos con
+	// - Saltos mÃ¡s largos que MAX_ANIM_DIST_M no se animan: el bus
+	//   aparece directo en la posiciÃ³n nueva.
+	// - Si la velocidad implÃ­cita del tramo supera lo plausible para un
+	//   Ã³mnibus urbano, tampoco se anima (cubre saltos medianos con
 	//   poco tiempo transcurrido).
 	// - Si el camino por el trazado GTFS es un rodeo desproporcionado
-	//   respecto de la línea recta, se descarta el trazado para ese
+	//   respecto de la lÃ­nea recta, se descarta el trazado para ese
 	//   tramo (evita que un mal snap a una variante en bucle lo mande a
-	//   dar la vuelta por toda la línea en segundos).
+	//   dar la vuelta por toda la lÃ­nea en segundos).
 	const MAX_ANIM_DIST_M = 1_000;
 	const MAX_PLAUSIBLE_SPEED_KMH = 80;
 	const MAX_PATH_DETOUR_FACTOR = 2.5;
@@ -264,11 +266,11 @@
 		}
 	}
 
-	// --- Trazados GTFS por línea, para animar los buses SOBRE el
-	// recorrido real en vez de en línea recta ---
-	// Reusa el mismo endpoint /api/lines/{line}/shape que ya usás para
-	// pintar el trazado de la línea filtrada. Acá lo usamos puramente
-	// como geometría de referencia para la animación, cacheado por línea
+	// --- Trazados GTFS por lÃ­nea, para animar los buses SOBRE el
+	// recorrido real en vez de en lÃ­nea recta ---
+	// Reusa el mismo endpoint /api/lines/{line}/shape que ya usÃ¡s para
+	// pintar el trazado de la lÃ­nea filtrada. AcÃ¡ lo usamos puramente
+	// como geometrÃ­a de referencia para la animaciÃ³n, cacheado por lÃ­nea
 	// en memoria del componente (no se vuelve a pedir mientras viva el
 	// mapa montado).
 	let shapeCache = new Map<string, number[][][] | null>();
@@ -293,17 +295,17 @@
 		shapeFetchInFlight.set(line, promise);
 	}
 
-	// --- Interpolación de buses ---
+	// --- InterpolaciÃ³n de buses ---
 
 	interface AnimatedBusState {
 		from: [number, number];
 		to: [number, number];
 		start: number; // performance.now()
-		duration: number; // ms; 0 = sin animación, aparece directo
+		duration: number; // ms; 0 = sin animaciÃ³n, aparece directo
 		properties: Record<string, unknown>;
-		// Si hay trazado GTFS disponible y el bus está razonablemente
-		// cerca de él, se anima a lo largo de estos vértices (parametrizado
-		// por distancia acumulada) en vez de en línea recta.
+		// Si hay trazado GTFS disponible y el bus estÃ¡ razonablemente
+		// cerca de Ã©l, se anima a lo largo de estos vÃ©rtices (parametrizado
+		// por distancia acumulada) en vez de en lÃ­nea recta.
 		path?: [number, number][];
 		cumDist?: number[];
 		totalDist?: number;
@@ -317,12 +319,8 @@
 		return a + (b - a) * t;
 	}
 
-	function easeOutQuad(t: number): number {
-		return t * (2 - t);
-	}
-
-	/** Distancia al cuadrado en grados — solo sirve para COMPARAR y
-	 * elegir el punto/variante más cercano, no es una distancia real en
+	/** Distancia al cuadrado en grados â solo sirve para COMPARAR y
+	 * elegir el punto/variante mÃ¡s cercano, no es una distancia real en
 	 * metros. Alcanza para esto porque es puramente visual. */
 	function degDistSq(a: [number, number], b: [number, number]): number {
 		const dx = a[0] - b[0];
@@ -331,8 +329,8 @@
 	}
 
 	/** Distancia real aproximada en metros entre dos coords [lng, lat]
-	 * (haversine). Se usa para decidir si un salto de posición es
-	 * animable o es ruido que hay que mostrar sin animación. */
+	 * (haversine). Se usa para decidir si un salto de posiciÃ³n es
+	 * animable o es ruido que hay que mostrar sin animaciÃ³n. */
 	function distMeters(a: [number, number], b: [number, number]): number {
 		const R = 6_371_000;
 		const toRad = Math.PI / 180;
@@ -357,11 +355,11 @@
 		return { index: bestIndex, distSq: bestDist };
 	}
 
-	/** Busca, entre las variantes de recorrido de una línea, el tramo del
-	 * trazado GTFS entre `from` y `to`. Si el bus está demasiado lejos de
-	 * cualquier variante conocida (desvío, depósito, GPS ruidoso), o no
-	 * hay shape cacheado todavía para esa línea, devuelve null — el
-	 * llamador cae de vuelta a línea recta para ese tramo puntual. */
+	/** Busca, entre las variantes de recorrido de una lÃ­nea, el tramo del
+	 * trazado GTFS entre `from` y `to`. Si el bus estÃ¡ demasiado lejos de
+	 * cualquier variante conocida (desvÃ­o, depÃ³sito, GPS ruidoso), o no
+	 * hay shape cacheado todavÃ­a para esa lÃ­nea, devuelve null â el
+	 * llamador cae de vuelta a lÃ­nea recta para ese tramo puntual. */
 	function buildPathBetween(
 		line: string,
 		from: [number, number],
@@ -403,9 +401,9 @@
 		}
 		if (segment.length < 2) return null;
 
-		// Los extremos se reemplazan por las coordenadas GPS reales — el
-		// punto más cercano del shape es una aproximación, no el punto
-		// exacto donde está el bus.
+		// Los extremos se reemplazan por las coordenadas GPS reales â el
+		// punto mÃ¡s cercano del shape es una aproximaciÃ³n, no el punto
+		// exacto donde estÃ¡ el bus.
 		const path: [number, number][] = [
 			from,
 			...(segment.slice(1, -1) as [number, number][]),
@@ -445,12 +443,11 @@
 	function currentInterpolatedPosition(state: AnimatedBusState, now: number): [number, number] {
 		if (state.duration <= 0) return state.to;
 		const t = Math.min(1, (now - state.start) / state.duration);
-		const eased = easeOutQuad(t);
 
 		if (state.path && state.cumDist && state.totalDist) {
-			return positionAlongPath(state.path, state.cumDist, state.totalDist, eased);
+			return positionAlongPath(state.path, state.cumDist, state.totalDist, t);
 		}
-		return [lerp(state.from[0], state.to[0], eased), lerp(state.from[1], state.to[1], eased)];
+		return [lerp(state.from[0], state.to[0], t), lerp(state.from[1], state.to[1], t)];
 	}
 
 	function buildBusProperties(bus: LiveBus): Record<string, unknown> {
@@ -470,7 +467,7 @@
 	}
 
 	/** Pinta un cuadro con las posiciones interpoladas actuales.
-	 * Devuelve true si todavía queda algún bus en tránsito (para saber si
+	 * Devuelve true si todavÃ­a queda algÃºn bus en trÃ¡nsito (para saber si
 	 * hace falta pedir otro frame). */
 	function renderBusesFrame(): boolean {
 		if (!map) return false;
@@ -495,7 +492,7 @@
 	}
 
 	function startBusAnimationLoop() {
-		if (busAnimationFrameId !== null) return; // ya está corriendo
+		if (busAnimationFrameId !== null) return; // ya estÃ¡ corriendo
 		const step = () => {
 			const stillAnimating = renderBusesFrame();
 			busAnimationFrameId = stillAnimating ? requestAnimationFrame(step) : null;
@@ -524,25 +521,25 @@
 			const existing = animatedBuses.get(bus.busId);
 
 			if (!existing || prefersReducedMotion) {
-				// Bus nuevo (o sin animación por preferencia del usuario):
-				// aparece directo en su posición, sin interpolar desde
-				// ningún lado.
+				// Bus nuevo (o sin animaciÃ³n por preferencia del usuario):
+				// aparece directo en su posiciÃ³n, sin interpolar desde
+				// ningÃºn lado.
 				animatedBuses.set(bus.busId, { from: target, to: target, start: now, duration: 0, properties });
 				continue;
 			}
 
-			// Arranca desde la posición interpolada ACTUAL (no desde el
-			// `to` ni el `from` del tramo anterior) — si un update nuevo
-			// llega antes de que termine la animación previa, esto evita
+			// Arranca desde la posiciÃ³n interpolada ACTUAL (no desde el
+			// `to` ni el `from` del tramo anterior) â si un update nuevo
+			// llega antes de que termine la animaciÃ³n previa, esto evita
 			// un salto/parpadeo visual.
 			const currentPos = currentInterpolatedPosition(existing, now);
 			const jumpMeters = distMeters(currentPos, target);
 			const elapsed = now - existing.start;
 			const duration = Math.min(MAX_ANIM_MS, Math.max(MIN_ANIM_MS, elapsed || BUSES_POLL_MS));
 
-			// Salto imposible para un ómnibus real (GPS viejo, ruido,
-			// cambio de recorrido): se muestra directo, sin animar —
-			// animarlo era lo que hacía "volar" los buses por el mapa.
+			// Salto imposible para un Ã³mnibus real (GPS viejo, ruido,
+			// cambio de recorrido): se muestra directo, sin animar â
+			// animarlo era lo que hacÃ­a "volar" los buses por el mapa.
 			const impliedKmh = (jumpMeters / (duration / 1000)) * 3.6;
 			if (jumpMeters > MAX_ANIM_DIST_M || impliedKmh > MAX_PLAUSIBLE_SPEED_KMH) {
 				animatedBuses.set(bus.busId, { from: target, to: target, start: now, duration: 0, properties });
@@ -554,7 +551,7 @@
 				const straightDeg = Math.sqrt(degDistSq(currentPos, target));
 				if (straightDeg > 0 && pathInfo.totalDist / straightDeg > MAX_PATH_DETOUR_FACTOR) {
 					// Rodeo desproporcionado por un mal snap al trazado:
-					// línea recta para este tramo puntual.
+					// lÃ­nea recta para este tramo puntual.
 					pathInfo = null;
 				}
 			}
@@ -571,18 +568,18 @@
 			});
 		}
 
-		// Buses que ya no están en el nuevo listado (salieron del
+		// Buses que ya no estÃ¡n en el nuevo listado (salieron del
 		// viewport, dejaron de servir la parada, etc.) desaparecen
 		// directo, sin animar la salida.
 		for (const id of animatedBuses.keys()) {
 			if (!seenIds.has(id)) animatedBuses.delete(id);
 		}
 
-		// Pinta un cuadro YA, sincrónicamente — así las features existen
-		// en el source ANTES de aplicar el feature-state de selección
-		// (mismo orden que la versión no-animada: setData y recién
-		// después el highlight), y no hay un frame de delay esperando al
-		// próximo rAF.
+		// Pinta un cuadro YA, sincrÃ³nicamente â asÃ­ las features existen
+		// en el source ANTES de aplicar el feature-state de selecciÃ³n
+		// (mismo orden que la versiÃ³n no-animada: setData y reciÃ©n
+		// despuÃ©s el highlight), y no hay un frame de delay esperando al
+		// prÃ³ximo rAF.
 		renderBusesFrame();
 		applySelectedBusHighlight();
 		startBusAnimationLoop();
@@ -645,7 +642,7 @@
 				}
 			}
 		} catch (err) {
-			console.warn('[BusMap] no se pudieron cargar buses de la línea', err);
+			console.warn('[BusMap] no se pudieron cargar buses de la lÃ­nea', err);
 			if (shouldReport('busmap.buses-by-line')) {
         	Sentry.captureException(err, { level: 'warning', tags: { source: 'busmap.buses-by-line' } });
     		}
@@ -666,7 +663,7 @@
 				source.setData({ type: 'FeatureCollection', features: [] });
 			}
 		} catch (err) {
-			console.warn('[BusMap] no se pudo cargar el trazado de la línea', err);
+			console.warn('[BusMap] no se pudo cargar el trazado de la lÃ­nea', err);
 		}
 	}
 
@@ -675,12 +672,12 @@
 		source?.setData({ type: 'FeatureCollection', features: [] });
 	}
 
-	// --- Trazado del viaje planificado ("Cómo llegar") ---
+	// --- Trazado del viaje planificado ("CÃ³mo llegar") ---
 
-	/** Una línea puede tener varias variantes de recorrido (ida/vuelta,
-	 * ramales). Elige la que pasa más cerca de ambas paradas del tramo, y
-	 * devuelve SOLO el segmento entre esas dos paradas — no el recorrido
-	 * completo de la línea, que sería ruidoso para un viaje puntual. */
+	/** Una lÃ­nea puede tener varias variantes de recorrido (ida/vuelta,
+	 * ramales). Elige la que pasa mÃ¡s cerca de ambas paradas del tramo, y
+	 * devuelve SOLO el segmento entre esas dos paradas â no el recorrido
+	 * completo de la lÃ­nea, que serÃ­a ruidoso para un viaje puntual. */
 	function clipShapeToLeg(
 		boardCoord: [number, number],
 		alightCoord: [number, number],
@@ -731,8 +728,8 @@
 		const firstBoard = option.legs[0].boardStop.coordinates;
 		const lastAlight = option.legs[option.legs.length - 1].alightStop.coordinates;
 
-		// Caminatas como línea recta punteada — no hay ruteo peatonal
-		// real disponible, es solo una referencia de "hacia dónde
+		// Caminatas como lÃ­nea recta punteada â no hay ruteo peatonal
+		// real disponible, es solo una referencia de "hacia dÃ³nde
 		// caminar", no calles exactas.
 		walkSource.setData({
 			type: 'FeatureCollection',
@@ -852,23 +849,23 @@
 		locateStatus = 'idle';
 		switch (err.code) {
 			case err.PERMISSION_DENIED:
-				geoError = 'Permiso de ubicación denegado. Habilitalo en la configuración del navegador.';
+				geoError = 'Permiso de ubicaciÃ³n denegado. Habilitalo en la configuraciÃ³n del navegador.';
 				break;
 			case err.POSITION_UNAVAILABLE:
-				geoError = 'No se pudo determinar tu ubicación ahora mismo.';
+				geoError = 'No se pudo determinar tu ubicaciÃ³n ahora mismo.';
 				break;
 			case err.TIMEOUT:
-				geoError = 'La búsqueda de ubicación tardó demasiado. Probá de nuevo.';
+				geoError = 'La bÃºsqueda de ubicaciÃ³n tardÃ³ demasiado. ProbÃ¡ de nuevo.';
 				break;
 			default:
-				geoError = 'No se pudo obtener tu ubicación.';
+				geoError = 'No se pudo obtener tu ubicaciÃ³n.';
 		}
 		stopLocating();
 	}
 
 	function startLocating() {
 		if (!('geolocation' in navigator)) {
-			geoError = 'Este navegador no soporta geolocalización.';
+			geoError = 'Este navegador no soporta geolocalizaciÃ³n.';
 			return;
 		}
 
@@ -1043,7 +1040,7 @@
 				});
 
 				// Viaje planificado: caminatas punteadas por debajo del
-				// trazado de línea, para que la línea sólida quede como
+				// trazado de lÃ­nea, para que la lÃ­nea sÃ³lida quede como
 				// elemento principal.
 				map.addSource(TRIP_WALK_SOURCE_ID, {
 					type: 'geojson',
@@ -1163,7 +1160,7 @@
 				});
 
 				// Puntos de origen/destino del viaje: por encima de todo lo
-				// demás, para que siempre sean el elemento más visible.
+				// demÃ¡s, para que siempre sean el elemento mÃ¡s visible.
 				map.addSource(TRIP_POINTS_SOURCE_ID, {
 					type: 'geojson',
 					data: { type: 'FeatureCollection', features: [] }
@@ -1272,11 +1269,11 @@
 			map.on('sourcedata', (e) => {
 				if (e.isSourceLoaded && !tilesLoaded) {
 					tilesLoaded = true;
-					// Si el aviso de red seguía puesto (tiles tardaron más de
-					// 6s pero terminaron cargando), lo limpiamos — el
+					// Si el aviso de red seguÃ­a puesto (tiles tardaron mÃ¡s de
+					// 6s pero terminaron cargando), lo limpiamos â el
 					// problema ya no existe. No tocamos debugMessage si es
 					// un error real de MapLibre (ver handler 'error' abajo).
-					if (debugMessage?.startsWith('El mapa no recibió datos')) {
+					if (debugMessage?.startsWith('El mapa no recibiÃ³ datos')) {
 						debugMessage = null;
 					}
 				}
@@ -1285,7 +1282,7 @@
 			setTimeout(() => {
 				if (!tilesLoaded && !debugMessage) {
 					debugMessage =
-						'El mapa no recibió datos de tiles.openfreemap.org en 6s. Probablemente la red actual está bloqueando ese dominio.';
+						'El mapa no recibiÃ³ datos de tiles.openfreemap.org en 6s. Probablemente la red actual estÃ¡ bloqueando ese dominio.';
 				}
 			}, 6000);
 		})();
@@ -1314,7 +1311,7 @@
 	class:active={locateStatus === 'active'}
 	class:locating={locateStatus === 'locating'}
 	onclick={toggleLocate}
-	aria-label={locateStatus === 'idle' ? 'Mostrar mi ubicación' : 'Dejar de mostrar mi ubicación'}
+	aria-label={locateStatus === 'idle' ? 'Mostrar mi ubicaciÃ³n' : 'Dejar de mostrar mi ubicaciÃ³n'}
 	aria-pressed={locateStatus !== 'idle'}
 >
 	<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1329,14 +1326,14 @@
 {#if geoError}
 	<div class="geo-error-banner">
 		{geoError}
-		<button class="geo-error-dismiss" onclick={() => (geoError = null)} aria-label="Cerrar aviso">×</button>
+		<button class="geo-error-dismiss" onclick={() => (geoError = null)} aria-label="Cerrar aviso">Ã</button>
 	</div>
 {/if}
 
 {#if debugMessage}
 	<div class="debug-banner">
 		<span>{debugMessage}</span>
-		<button class="debug-dismiss" onclick={() => (debugMessage = null)} aria-label="Cerrar aviso">×</button>
+		<button class="debug-dismiss" onclick={() => (debugMessage = null)} aria-label="Cerrar aviso">Ã</button>
 	</div>
 {/if}
 
