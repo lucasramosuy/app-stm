@@ -7,7 +7,8 @@
 		options = [],
 		onClose,
 		onSaveRoutine,
-		onShareTrip
+		onShareTrip,
+		onStartTrip
 	}: {
 		loading?: boolean;
 		error?: string | null;
@@ -15,6 +16,7 @@
 		onClose?: () => void;
 		onSaveRoutine?: () => void;
 		onShareTrip?: () => void;
+		onStartTrip?: () => void;
 	} = $props();
 
 	function fmtWalk(m: number): string {
@@ -72,10 +74,18 @@
 		{/each}
 	{/if}
 
-		{#if options.length > 0 && (onSaveRoutine || onShareTrip)}
+		{#if options.length > 0 && (onStartTrip || onSaveRoutine || onShareTrip)}
 			<div class="trip-actions">
+				{#if onStartTrip}
+					<button class="trip-action-btn primary" onclick={() => onStartTrip?.()}>
+						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+							<polygon points="6 3 20 12 6 21 6 3" />
+						</svg>
+						Iniciar viaje
+					</button>
+				{/if}
 				{#if onSaveRoutine}
-					<button class="trip-action-btn primary" onclick={() => onSaveRoutine?.()}>
+					<button class="trip-action-btn ghost" onclick={() => onSaveRoutine?.()}>
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
 							<rect x="3" y="4" width="18" height="18" rx="3" />
 							<line x1="16" y1="2" x2="16" y2="6" />
