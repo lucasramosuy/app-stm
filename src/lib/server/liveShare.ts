@@ -89,7 +89,7 @@ async function createNetlifyStore(): Promise<LiveShareStore> {
 		},
 		async set(id, record) {
 			await store.setJSON(id, record, {
-				metadata: { expiration: String(record.expiresAt) }
+				metadata: { expiration: record.expiresAt }
 			});
 		},
 		async delete(id) {
