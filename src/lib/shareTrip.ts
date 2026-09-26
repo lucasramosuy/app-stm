@@ -20,6 +20,9 @@ export interface SharedTrip {
 	bs?: [number, number]; // coordenadas de la parada de subida
 	as?: [number, number]; // coordenadas de la parada de bajada
 	busId?: number; // si se comparte un ómnibus puntual en vivo
+	liveId?: string; // sesión de ubicación en vivo (POST /api/live-share) — si está,
+	// la página pública además muestra la posición de quien comparte,
+	// actualizada cada pocos segundos hasta que la sesión termina o expira
 	exp: number; // epoch ms — el link deja de actualizarse ahí
 }
 
