@@ -3,7 +3,8 @@
  * scripts/build-shapes.mjs
  *
  * Procesa el GTFS estático de STM (ya descomprimido en disco) y genera
- * src/lib/server/data/route-shapes.json con la geometría de cada línea.
+ * un JSON por línea en src/lib/server/data/shapes/<linea>.json con la
+ * geometría de cada recorrido.
  *
  * Se corre UNA SOLA VEZ, manualmente, cada vez que STM publica un GTFS
  * nuevo. No se ejecuta en cada request ni en cada deploy — el JSON
@@ -18,7 +19,7 @@
  * $HOME/Downloads/gtfs en mac/linux).
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
@@ -27,7 +28,13 @@ import { parse } from 'csv-parse/sync';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const gtfsDir = process.argv[2] || join(os.homedir(), 'Downloads', 'gtfs');
-const outPath = join(__dirname, '..', 'src', 'lib', 'server', 'data', 'route-shapes.json');
+const outDir = join(__dirname, '..', 'src', 'lib', 'server', 'data', 'shapes');
+
+// Los nombres de línea pueden traer espacios u otros caracteres
+// (ej. "124 Sd") que no sirven tal cual como nombre de archivo.
+// MISMA sanitización que src/lib/server/routeShapes.ts (shapeFileName) —
+// si se cambia acá, cambiar allá también.
+const sanitize = (line) => line.replace(/[^A-Za-z0-9-]/g, '_');
 
 console.log(`[build-shapes] leyendo GTFS desde: ${gtfsDir}`);
 
@@ -85,11 +92,17 @@ console.log(
 	`[build-shapes] shapes.txt: ${shapePoints.length} puntos, ${shapeIdToPoints.size} shapes distintos`
 );
 
-// --- 4. Armar el JSON final -------------------------------------------------
-// { "103": [[[lon,lat],...], [[lon,lat],...]], ... }
-// Array de shapes por línea, porque una línea puede tener varias variantes
-// físicas de recorrido (ida/vuelta, ramales, etc.)
-const output = {};
+// --- 4. Escribir un JSON por línea ------------------------------------------
+// Cada archivo es un array de shapes por línea, porque una línea puede
+// tener varias variantes físicas de recorrido (ida/vuelta, ramales, etc.):
+// [[[lon,lat],...], [[lon,lat],...]]
+// Se borra el directorio antes de escribir para que las líneas dadas de
+// baja en el GTFS nuevo no queden como archivos huérfanos.
+rmSync(outDir, { recursive: true, force: true });
+mkdirSync(outDir, { recursive: true });
+
+let written = 0;
+let totalBytes = 0;
 for (const [shortName, shapeIds] of shortNameToShapeIds) {
 	const shapes = [];
 	for (const shapeId of shapeIds) {
@@ -97,13 +110,13 @@ for (const [shortName, shapeIds] of shortNameToShapeIds) {
 		if (!points || points.length === 0) continue;
 		shapes.push(points.map((p) => [p.lon, p.lat]));
 	}
-	if (shapes.length > 0) output[shortName] = shapes;
+	if (shapes.length > 0) {
+		const json = JSON.stringify(shapes);
+		writeFileSync(join(outDir, `${sanitize(shortName)}.json`), json);
+		written += 1;
+		totalBytes += json.length;
+	}
 }
 
-mkdirSync(dirname(outPath), { recursive: true });
-writeFileSync(outPath, JSON.stringify(output));
-
-const sizeKb = (JSON.stringify(output).length / 1024).toFixed(0);
-console.log(
-	`[build-shapes] listo: ${Object.keys(output).length} líneas escritas en ${outPath} (${sizeKb} KB)`
-);
+const sizeKb = (totalBytes / 1024).toFixed(0);
+console.log(`[build-shapes] listo: ${written} archivos de línea escritos en ${outDir} (${sizeKb} KB)`);
