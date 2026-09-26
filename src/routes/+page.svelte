@@ -25,6 +25,8 @@
 	import { etaToMinutes, type BusStopDetail, type UpcomingBus } from '$lib/types/stm';
 	import type { TripOption } from '$lib/types/trip';
 	import { initClarity } from '$lib/analytics/clarity';
+	import { collectArrivalHits } from '$lib/arrivalAlerts';
+	import { loadJson, saveJson, loadFlag, saveFlag } from '$lib/persist';
 	import { env } from '$env/dynamic/public';
 
 	const POLL_INTERVAL_MS = 20_000;
@@ -166,29 +168,15 @@
 		const filtered = recentItems.filter((r) => r.id !== item.id);
 		const updated = [item, ...filtered].slice(0, 5);
 		recentItems = updated;
-		try {
-			localStorage.setItem(RECENT_KEY, JSON.stringify(updated));
-		} catch (e) {
-			console.warn('[LocalStorage] no se pudo guardar recientes', e);
-		}
+		saveJson(RECENT_KEY, updated, '[LocalStorage] no se pudo guardar recientes');
 	}
 
 	function loadRecents() {
-		try {
-			const raw = localStorage.getItem(RECENT_KEY);
-			if (raw) recentItems = JSON.parse(raw);
-		} catch (e) {
-			console.warn('[LocalStorage] no se pudo leer recientes', e);
-		}
+		recentItems = loadJson(RECENT_KEY, recentItems, '[LocalStorage] no se pudo leer recientes');
 	}
 
 	function loadFavorites() {
-		try {
-			const raw = localStorage.getItem(FAVORITES_KEY);
-			if (raw) favoriteItems = JSON.parse(raw);
-		} catch (e) {
-			console.warn('[LocalStorage] no se pudo leer favoritos', e);
-		}
+		favoriteItems = loadJson(FAVORITES_KEY, favoriteItems, '[LocalStorage] no se pudo leer favoritos');
 	}
 
 	function isFavorite(id: string): boolean {
@@ -203,40 +191,27 @@
 			updated = [item, ...favoriteItems];
 		}
 		favoriteItems = updated;
-		try {
-			localStorage.setItem(FAVORITES_KEY, JSON.stringify(updated));
-		} catch (e) {
-			console.warn('[LocalStorage] no se pudo guardar favoritos', e);
-		}
+		saveJson(FAVORITES_KEY, updated, '[LocalStorage] no se pudo guardar favoritos');
 	}
 
 	// --- Notificaciones del sistema ---
 
 	function persistNotificationsPref(value: boolean) {
-		try {
-			localStorage.setItem(NOTIFICATIONS_ENABLED_KEY, value ? '1' : '0');
-		} catch (e) {
-			console.warn('[LocalStorage] no se pudo guardar preferencia de notificaciones', e);
-		}
+		saveFlag(NOTIFICATIONS_ENABLED_KEY, value, '[LocalStorage] no se pudo guardar preferencia de notificaciones');
 	}
 
 	function loadNotificationsPref() {
-		try {
-			const raw = localStorage.getItem(NOTIFICATIONS_ENABLED_KEY);
-			// Solo lo activamos si el permiso del navegador SIGUE
-			// concedido — si el usuario lo revocó desde la configuración
-			// del sitio, no tiene sentido mostrar el toggle como activado
-			// cuando en realidad ya no va a disparar nada.
-			if (
-				raw === '1' &&
-				typeof window !== 'undefined' &&
-				'Notification' in window &&
-				Notification.permission === 'granted'
-			) {
-				notificationsEnabled = true;
-			}
-		} catch (e) {
-			console.warn('[LocalStorage] no se pudo leer preferencia de notificaciones', e);
+		// Solo lo activamos si el permiso del navegador SIGUE
+		// concedido — si el usuario lo revocó desde la configuración
+		// del sitio, no tiene sentido mostrar el toggle como activado
+		// cuando en realidad ya no va a disparar nada.
+		if (
+			loadFlag(NOTIFICATIONS_ENABLED_KEY, '[LocalStorage] no se pudo leer preferencia de notificaciones') &&
+			typeof window !== 'undefined' &&
+			'Notification' in window &&
+			Notification.permission === 'granted'
+		) {
+			notificationsEnabled = true;
 		}
 	}
 
@@ -333,22 +308,10 @@
 	 * polls sucesivos — solo cuando entra de nuevo tras haber salido de
 	 * la lista (p. ej. otra vuelta del mismo recorrido). */
 	function checkArrivalAlerts(upcoming: UpcomingBus[]) {
-		const stillPresent = new Set<number>();
-
-		for (const bus of upcoming) {
-			stillPresent.add(bus.busId);
-			const minutes = etaToMinutes(bus.eta);
-			if (minutes < ARRIVAL_ALERT_THRESHOLD_MIN && !alertedBusIds.has(bus.busId)) {
-				alertedBusIds.add(bus.busId);
-				pushArrivalAlert(bus.line, bus.destination, minutes);
-			}
-		}
-
-		// Si un bus ya alertado desaparece del listado (llegó, pasó de
-		// largo, o simplemente ya no es "upcoming"), se libera para que
-		// pueda volver a alertar si reaparece más adelante.
-		for (const id of alertedBusIds) {
-			if (!stillPresent.has(id)) alertedBusIds.delete(id);
+		// La lógica de umbral / no-repetir / re-armar vive en
+		// $lib/arrivalAlerts (testeada en test/arrivalAlerts.test.ts).
+		for (const hit of collectArrivalHits(alertedBusIds, upcoming, ARRIVAL_ALERT_THRESHOLD_MIN)) {
+			pushArrivalAlert(hit.line, hit.destination, hit.etaMinutes);
 		}
 	}
 
@@ -784,12 +747,8 @@
 		// (WELCOME_SEEN_KEY), arrancamos Clarity de una. Si es la
 		// primera vez, se dispara recién en dismissWelcome() — no antes
 		// de mostrarle el aviso.
-		try {
-			if (localStorage.getItem(WELCOME_SEEN_KEY)) {
-				initClarity(env.PUBLIC_CLARITY_ID);
-			}
-		} catch (e) {
-			console.warn('[LocalStorage] no se pudo leer welcome_seen para Clarity', e);
+		if (loadFlag(WELCOME_SEEN_KEY, '[LocalStorage] no se pudo leer welcome_seen para Clarity')) {
+			initClarity(env.PUBLIC_CLARITY_ID);
 		}
 
 		const params = new URLSearchParams(window.location.search);
@@ -799,12 +758,8 @@
 		const lineParam = params.get('line') || params.get('linea');
 
 		if (!stopParam && !lineParam) {
-			try {
-				if (!localStorage.getItem(WELCOME_SEEN_KEY)) {
-					showWelcome = true;
-				}
-			} catch (e) {
-				console.warn('[LocalStorage] no se pudo leer welcome_seen', e);
+			if (!loadFlag(WELCOME_SEEN_KEY, '[LocalStorage] no se pudo leer welcome_seen')) {
+				showWelcome = true;
 			}
 		}
 
@@ -825,11 +780,7 @@
 
 	function dismissWelcome() {
 		showWelcome = false;
-		try {
-			localStorage.setItem(WELCOME_SEEN_KEY, '1');
-		} catch (e) {
-			console.warn('[LocalStorage] no se pudo guardar welcome_seen', e);
-		}
+		saveFlag(WELCOME_SEEN_KEY, true, '[LocalStorage] no se pudo guardar welcome_seen');
 		initClarity(env.PUBLIC_CLARITY_ID);
 	}
 
