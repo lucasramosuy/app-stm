@@ -128,7 +128,7 @@ jobs:
 
           unzip -o /tmp/google_transit.zip -d "$GTFS_DIR"
 
-      - name: Regenerar route-shapes.json
+      - name: Regenerar shapes por línea
         if: steps.compare.outputs.changed == 'true'
         run: node scripts/build-shapes.mjs "$GTFS_DIR"
 
@@ -142,17 +142,17 @@ jobs:
         if: steps.compare.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
-          commit-message: 'chore(gtfs): actualizar route-shapes.json a versión ${{ steps.remote.outputs.version }}'
+          commit-message: 'chore(gtfs): actualizar shapes por línea a versión ${{ steps.remote.outputs.version }}'
           title: 'GTFS actualizado: versión ${{ steps.remote.outputs.version }}'
           body: |
             STM publicó una nueva versión del GTFS estático (`${{ steps.remote.outputs.version }}`).
 
-            Este PR regenera `route-shapes.json` a partir del nuevo `google_transit.zip`.
+            Este PR regenera los shapes por línea (`src/lib/server/data/shapes/`) a partir del nuevo `google_transit.zip`.
 
             **Revisar antes de mergear:** confirmar visualmente en el mapa que los
             trazados de algunas líneas conocidas no se rompieron (cambios de
             recorrido, líneas nuevas, líneas dadas de baja).
           branch: gtfs-update-${{ steps.remote.outputs.version }}
           add-paths: |
-            src/lib/server/data/route-shapes.json
+            src/lib/server/data/shapes/
             ${{ env.GTFS_VERSION_FILE }}

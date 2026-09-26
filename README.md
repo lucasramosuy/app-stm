@@ -101,6 +101,10 @@ Aplicación web moderna y rápida en tiempo real para visualizar ómnibus, parad
 
 El módulo `src/lib/server/stmAuth.ts` cachea el token OAuth en memoria del proceso (válido por 300s) para evitar sobrecargar los servidores de STM con peticiones repetidas de autenticación. Por esto se usa `adapter-netlify` (runtime Node persistente) en vez de edge/Workers.
 
+### Geometrías de recorrido (shapes por línea)
+
+`src/lib/server/data/shapes/<linea>.json` guarda la geometría de cada línea (un archivo por línea, regenerado semanalmente desde el GTFS por el workflow `gtfs-update`). `src/lib/server/routeShapes.ts` las carga con import dinámico: Vite emite un chunk por línea y solo se carga el de la línea pedida. Antes era un único JSON de ~9MB importado estático que inflaba la función serverless entera (~10.8MB parseados en cada cold start).
+
 ### Variables de entorno en Netlify
 
 En **Site settings → Environment variables**, configurar las mismas ocho variables del `.env` local:

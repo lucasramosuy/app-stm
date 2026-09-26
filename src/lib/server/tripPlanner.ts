@@ -143,9 +143,8 @@ function directOptions(originStops: StopWithLines[], destStops: StopWithLines[])
 	);
 }
 
-function linesAreTransferable(lineA: string, lineB: string): boolean {
-	const shapesA = getRouteShape(lineA);
-	const shapesB = getRouteShape(lineB);
+async function linesAreTransferable(lineA: string, lineB: string): Promise<boolean> {
+	const [shapesA, shapesB] = await Promise.all([getRouteShape(lineA), getRouteShape(lineB)]);
 	if (!shapesA || !shapesB) return false;
 	for (const a of shapesA) {
 		for (const b of shapesB) {
@@ -155,9 +154,8 @@ function linesAreTransferable(lineA: string, lineB: string): boolean {
 	return false;
 }
 
-function findCrossPoint(lineA: string, lineB: string): [number, number] | null {
-	const shapesA = getRouteShape(lineA);
-	const shapesB = getRouteShape(lineB);
+async function findCrossPoint(lineA: string, lineB: string): Promise<[number, number] | null> {
+	const [shapesA, shapesB] = await Promise.all([getRouteShape(lineA), getRouteShape(lineB)]);
 	if (!shapesA || !shapesB) return null;
 
 	let closest: [number, number] | null = null;
@@ -200,9 +198,9 @@ async function oneTransferOptions(
 			}
 
 			if (l1 === l2) continue;
-			if (!linesAreTransferable(l1, l2)) continue;
+			if (!(await linesAreTransferable(l1, l2))) continue;
 
-			const crossPoint = findCrossPoint(l1, l2);
+			const crossPoint = await findCrossPoint(l1, l2);
 			if (!crossPoint) continue;
 
 			const transferCandidates = await findNearbyStopsWithLines(crossPoint, radiusM, budget);
