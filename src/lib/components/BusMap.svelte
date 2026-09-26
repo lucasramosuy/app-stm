@@ -68,6 +68,7 @@
 		tripOrigin = null,
 		tripDestination = null,
 		tripOption = null,
+		sharedUserPosition = null,
 		onSelectStop,
 		onSelectBus,
 		onSelectPoi
@@ -81,6 +82,9 @@
 		tripOrigin?: { coordinates: [number, number] } | null;
 		tripDestination?: { coordinates: [number, number] } | null;
 		tripOption?: TripOption | null;
+		// Punto de una ubicación compartida en vivo (página /v): pisa al
+		// GPS propio para el dot del mapa cuando está presente.
+		sharedUserPosition?: { coordinates: [number, number] } | null;
 		onSelectStop?: (busstopId: number) => void;
 		onSelectBus?: (bus: MapBusSelection) => void;
 		onSelectPoi?: (poi: { label: string; coordinates: [number, number] }) => void;
@@ -765,9 +769,15 @@
 	}
 
 	function updateUserLocationLayer() {
-		if (!map || !lastUserCoords) return;
+		if (!map) return;
+		const shared = sharedUserPosition?.coordinates ?? null;
+		const coords = shared ?? lastUserCoords;
 		const source = map.getSource(USER_LOCATION_SOURCE_ID) as GeoJSONSource | undefined;
 		if (!source) return;
+		if (!coords) {
+			clearUserLocationLayer();
+			return;
+		}
 
 		source.setData({
 			type: 'FeatureCollection',
@@ -775,19 +785,31 @@
 				{
 					type: 'Feature',
 					properties: {},
-					geometry: { type: 'Point', coordinates: lastUserCoords }
+					geometry: { type: 'Point', coordinates: coords }
 				}
 			]
 		});
 
-		const radiusPx = metersToPixels(lastUserAccuracy, lastUserCoords[1], map.getZoom());
-		map.setPaintProperty(USER_LOCATION_ACCURACY_LAYER_ID, 'circle-radius', Math.max(radiusPx, 12));
+		if (shared) {
+			// Sin dato de precisión del otro teléfono: no dibujamos el
+			// círculo de accuracy.
+			map.setPaintProperty(USER_LOCATION_ACCURACY_LAYER_ID, 'circle-radius', 0);
+		} else {
+			const radiusPx = metersToPixels(lastUserAccuracy, coords[1], map.getZoom());
+			map.setPaintProperty(USER_LOCATION_ACCURACY_LAYER_ID, 'circle-radius', Math.max(radiusPx, 12));
+		}
 	}
 
 	function clearUserLocationLayer() {
 		const source = map?.getSource(USER_LOCATION_SOURCE_ID) as GeoJSONSource | undefined;
 		source?.setData({ type: 'FeatureCollection', features: [] });
 	}
+
+	// La posición compartida llega por polling desde la página /v.
+	$effect(() => {
+		void sharedUserPosition;
+		if (mapReady) updateUserLocationLayer();
+	});
 
 	function handlePositionSuccess(position: GeolocationPosition) {
 		geoError = null;
@@ -845,7 +867,8 @@
 		}
 		locateStatus = 'idle';
 		lastUserCoords = null;
-		clearUserLocationLayer();
+		// Si hay una ubicación compartida activa, el dot pasa a mostrarla.
+		updateUserLocationLayer();
 	}
 
 	function toggleLocate() {
