@@ -4,7 +4,7 @@ Aplicación web moderna y rápida en tiempo real para visualizar ómnibus, parad
 
 ![Stack](https://img.shields.io/badge/SvelteKit-v5-FF3E00)
 ![MapLibre](https://img.shields.io/badge/MapLibre_GL-v6-blue)
-![TypeScript](https://img.shields.io/badge/TypeScript-v5-blue)
+![TypeScript](https://img.shields.io/badge/TypeScript-v6-blue)
 ![Deploy](https://img.shields.io/badge/Deploy-Netlify-00C7B7)
 ![PWA](https://img.shields.io/badge/PWA-Instalable-5A0FC8)
 ![Monitoring](https://img.shields.io/badge/Errores-Sentry-362D59)
