@@ -11,7 +11,7 @@
 	const trip: SharedTrip | null = $derived(decodeSharedTrip($page.params.data ?? ''));
 	const expired = $derived(trip !== null && Date.now() > trip.exp);
 
-	// OpciÃ³n de viaje sintÃ©tica (un solo tramo) para que el mapa dibuje
+	// Opción de viaje sintética (un solo tramo) para que el mapa dibuje
 	// el recorrido, las caminatas y los puntos de origen/destino.
 	const tripOption: TripOption | null = $derived(
 		trip && trip.bs && trip.as
@@ -41,7 +41,7 @@
 	let upcoming = $state<UpcomingBus[]>([]);
 	let nowTick = $state(Date.now());
 
-	// Primer bus de la lÃ­nea acercÃ¡ndose a la parada de bajada â es el
+	// Primer bus de la línea acercándose a la parada de bajada — es el
 	// que define el ETA que ve quien recibe el link.
 	const nextBus = $derived(
 		trip?.alightStopId
@@ -107,7 +107,7 @@
 </script>
 
 <svelte:head>
-	<title>Viaje compartido Â· Buses Montevideo</title>
+	<title>Viaje compartido · Buses Montevideo</title>
 </svelte:head>
 
 <main>
@@ -121,7 +121,7 @@
 				</span>
 				<span class="brand-name">Buses Montevideo</span>
 			</div>
-			<p class="notice-text">Este link no es vÃ¡lido.</p>
+			<p class="notice-text">Este link no es válido.</p>
 			<a class="notice-btn" href="/">Abrir Buses Montevideo</a>
 		</div>
 	{:else if expired}
@@ -134,7 +134,7 @@
 				</span>
 				<span class="brand-name">Buses Montevideo</span>
 			</div>
-			<p class="notice-text">Este viaje compartido expirÃ³. Pedile a la persona que te lo vuelva a mandar.</p>
+			<p class="notice-text">Este viaje compartido expiró. Pedile a la persona que te lo vuelva a mandar.</p>
 			<a class="notice-btn" href="/">Abrir Buses Montevideo</a>
 		</div>
 	{:else}
@@ -168,7 +168,7 @@
 			{#if arrivalLabel}
 				<div class="eta-time tabular-nums">{arrivalLabel}</div>
 			{:else}
-				<div class="eta-none">Sin Ã³mnibus de la lÃ­nea {trip.line} acercÃ¡ndose ahora.</div>
+				<div class="eta-none">Sin ómnibus de la línea {trip.line} acercándose ahora.</div>
 			{/if}
 
 			<div class="prog">
@@ -187,12 +187,12 @@
 			<div class="meta-row">
 				<span class="line-badge">{trip.line}</span>
 				<span class="meta-text">
-					LÃ­nea {trip.line}{#if distanceLabel} Â· {distanceLabel}{/if}
+					Línea {trip.line}{#if distanceLabel} · {distanceLabel}{/if}
 				</span>
 			</div>
 
 			<a class="open-btn" href="/">Abrir en la app</a>
-			<p class="exp-note">Link temporal Â· deja de actualizarse a las {expLabel}</p>
+			<p class="exp-note">Link temporal · deja de actualizarse a las {expLabel}</p>
 		</section>
 	{/if}
 </main>
