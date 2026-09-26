@@ -122,11 +122,13 @@
 	// --- Animación de marcadores de buses ---
 	// Los buses no "saltan" de una posición a otra en cada update: se
 	// interpola cuadro a cuadro con requestAnimationFrame. La duración de
-	// cada tramo se calcula del tiempo real transcurrido desde el update
-	// anterior de ESE bus puntual (no un valor fijo), así se adapta sola
-	// tanto al polling de 8s (viewport/línea) como al de 20s que llega
-	// desde afuera en modo "stop".
-	const MIN_ANIM_MS = 3_000;
+	// cada tramo es el tiempo real transcurrido desde el update anterior
+	// de ESE bus puntual (no un valor fijo) y la interpolación es LINEAL:
+	// el bus se mueve a la velocidad promedio real del tramo, pareja de
+	// punta a punta. (Antes se aplicaba un easing ease-out: cada tramo
+	// arrancaba rápido y terminaba arrastrándose, y eso se percibía como
+	// buses que "a veces van rápido, a veces lento".)
+	const MIN_ANIM_MS = 1_500;
 	const MAX_ANIM_MS = 20_000;
 
 	// Si el bus real está más lejos que esto del trazado GTFS conocido
@@ -317,10 +319,6 @@
 		return a + (b - a) * t;
 	}
 
-	function easeOutQuad(t: number): number {
-		return t * (2 - t);
-	}
-
 	/** Distancia al cuadrado en grados — solo sirve para COMPARAR y
 	 * elegir el punto/variante más cercano, no es una distancia real en
 	 * metros. Alcanza para esto porque es puramente visual. */
@@ -445,12 +443,11 @@
 	function currentInterpolatedPosition(state: AnimatedBusState, now: number): [number, number] {
 		if (state.duration <= 0) return state.to;
 		const t = Math.min(1, (now - state.start) / state.duration);
-		const eased = easeOutQuad(t);
 
 		if (state.path && state.cumDist && state.totalDist) {
-			return positionAlongPath(state.path, state.cumDist, state.totalDist, eased);
+			return positionAlongPath(state.path, state.cumDist, state.totalDist, t);
 		}
-		return [lerp(state.from[0], state.to[0], eased), lerp(state.from[1], state.to[1], eased)];
+		return [lerp(state.from[0], state.to[0], t), lerp(state.from[1], state.to[1], t)];
 	}
 
 	function buildBusProperties(bus: LiveBus): Record<string, unknown> {
