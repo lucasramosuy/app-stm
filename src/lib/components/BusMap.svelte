@@ -137,6 +137,24 @@
 	// distancia real en metros, solo sirve para comparar (~300m aprox).
 	const MAX_SNAP_DIST_SQ = 0.0027 * 0.0027;
 
+	// Anti "buses voladores": la posición que reporta STM a veces salta
+	// (GPS viejo que se actualiza de golpe, ruido, unidad que cambia de
+	// recorrido). Sin un límite, un salto de kilómetros se animaba
+	// durante hasta MAX_ANIM_MS y el bus se veía cruzar la ciudad
+	// volando. Reglas:
+	// - Saltos más largos que MAX_ANIM_DIST_M no se animan: el bus
+	//   aparece directo en la posición nueva.
+	// - Si la velocidad implícita del tramo supera lo plausible para un
+	//   ómnibus urbano, tampoco se anima (cubre saltos medianos con
+	//   poco tiempo transcurrido).
+	// - Si el camino por el trazado GTFS es un rodeo desproporcionado
+	//   respecto de la línea recta, se descarta el trazado para ese
+	//   tramo (evita que un mal snap a una variante en bucle lo mande a
+	//   dar la vuelta por toda la línea en segundos).
+	const MAX_ANIM_DIST_M = 1_000;
+	const MAX_PLAUSIBLE_SPEED_KMH = 80;
+	const MAX_PATH_DETOUR_FACTOR = 2.5;
+
 	let mapContainer: HTMLDivElement;
 	let map: MapLibreMap | undefined;
 	let mapReady = $state(false);
@@ -310,6 +328,20 @@
 		const dx = a[0] - b[0];
 		const dy = a[1] - b[1];
 		return dx * dx + dy * dy;
+	}
+
+	/** Distancia real aproximada en metros entre dos coords [lng, lat]
+	 * (haversine). Se usa para decidir si un salto de posición es
+	 * animable o es ruido que hay que mostrar sin animación. */
+	function distMeters(a: [number, number], b: [number, number]): number {
+		const R = 6_371_000;
+		const toRad = Math.PI / 180;
+		const dLat = (b[1] - a[1]) * toRad;
+		const dLng = (b[0] - a[0]) * toRad;
+		const lat1 = a[1] * toRad;
+		const lat2 = b[1] * toRad;
+		const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+		return 2 * R * Math.asin(Math.sqrt(h));
 	}
 
 	function nearestIndex(point: [number, number], coords: number[][]): { index: number; distSq: number } {
@@ -504,9 +536,28 @@
 			// llega antes de que termine la animación previa, esto evita
 			// un salto/parpadeo visual.
 			const currentPos = currentInterpolatedPosition(existing, now);
+			const jumpMeters = distMeters(currentPos, target);
 			const elapsed = now - existing.start;
 			const duration = Math.min(MAX_ANIM_MS, Math.max(MIN_ANIM_MS, elapsed || BUSES_POLL_MS));
-			const pathInfo = buildPathBetween(bus.line, currentPos, target);
+
+			// Salto imposible para un ómnibus real (GPS viejo, ruido,
+			// cambio de recorrido): se muestra directo, sin animar —
+			// animarlo era lo que hacía "volar" los buses por el mapa.
+			const impliedKmh = (jumpMeters / (duration / 1000)) * 3.6;
+			if (jumpMeters > MAX_ANIM_DIST_M || impliedKmh > MAX_PLAUSIBLE_SPEED_KMH) {
+				animatedBuses.set(bus.busId, { from: target, to: target, start: now, duration: 0, properties });
+				continue;
+			}
+
+			let pathInfo = buildPathBetween(bus.line, currentPos, target);
+			if (pathInfo) {
+				const straightDeg = Math.sqrt(degDistSq(currentPos, target));
+				if (straightDeg > 0 && pathInfo.totalDist / straightDeg > MAX_PATH_DETOUR_FACTOR) {
+					// Rodeo desproporcionado por un mal snap al trazado:
+					// línea recta para este tramo puntual.
+					pathInfo = null;
+				}
+			}
 
 			animatedBuses.set(bus.busId, {
 				from: currentPos,
