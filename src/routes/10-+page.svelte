@@ -1,0 +1,1888 @@
+<script lang="ts">
+	import * as Sentry from '@sentry/sveltekit';
+	import { onMount } from 'svelte';
+	import BusMap, { type MapBusSelection } from '$lib/components/BusMap.svelte';
+	import SearchBar from '$lib/components/SearchBar.svelte';
+	import BottomSheet from '$lib/components/BottomSheet.svelte';
+	import LineEtaCard from '$lib/components/LineEtaCard.svelte';
+	import BusDetailCard from '$lib/components/BusDetailCard.svelte';
+	import EmptyStateCard from '$lib/components/EmptyStateCard.svelte';
+	import WelcomeModal from '$lib/components/WelcomeModal.svelte';
+	import TripPlannerBar from '$lib/components/TripPlannerBar.svelte';
+	import TripResultsCard from '$lib/components/TripResultsCard.svelte';
+	import RoutineHero from '$lib/components/RoutineHero.svelte';
+	import RoutinesSection from '$lib/components/RoutinesSection.svelte';
+	import SaveRoutineCard from '$lib/components/SaveRoutineCard.svelte';
+	import ShareTripCard from '$lib/components/ShareTripCard.svelte';
+	import {
+		loadRoutines,
+		saveRoutines,
+		makeRoutineId,
+		nextRoutine,
+		type Routine
+	} from '$lib/routines';
+	import { encodeSharedTrip, SHARE_TTL_MS } from '$lib/shareTrip';
+	import { etaToMinutes, type BusStopDetail, type UpcomingBus } from '$lib/types/stm';
+	import type { TripOption } from '$lib/types/trip';
+	import { initClarity } from '$lib/analytics/clarity';
+	import { env } from '$env/dynamic/public';
+
+	const POLL_INTERVAL_MS = 20_000;
+	const SEARCH_DEBOUNCE_MS = 300;
+	const RECENT_KEY = 'app_stm_recents';
+	const FAVORITES_KEY = 'app_stm_favorites';
+	const WELCOME_SEEN_KEY = 'app_stm_welcome_seen';
+	const NOTIFICATIONS_ENABLED_KEY = 'app_stm_notifications_enabled';
+
+	// Alertas in-app de "bus a punto de llegar": se dispara un toast la
+	// PRIMERA vez que un bus de alguna parada seleccionada cruza el
+	// umbral, no en cada poll mientras sigue bajando el ETA.
+	const ARRIVAL_ALERT_THRESHOLD_MIN = 3;
+	const ARRIVAL_ALERT_DURATION_MS = 6_000;
+
+	interface RecentItem {
+		id: string;
+		type: 'stop' | 'line';
+		title: string;
+		busstopId?: number;
+		line?: string;
+	}
+
+	type FavoriteItem = RecentItem;
+
+	interface StopSelectionState {
+		busstopId: number;
+		detail: BusStopDetail | null;
+		upcoming: UpcomingBus[];
+		loading: boolean;
+		error: string;
+		stale: boolean;
+		lastUpdatedAt: number | null;
+		isDefault: boolean;
+		retryNotBefore: number | null;
+	}
+
+	interface TripPoint {
+		label: string;
+		coordinates: [number, number];
+		type: 'gps' | 'point';
+	}
+
+	interface ArrivalAlert {
+		id: string;
+		line: string;
+		destination: string;
+		etaMinutes: number;
+	}
+
+	let query = $state('');
+	let sheetOpen = $state(false);
+	let sidebarCollapsed = $state(false);
+
+	let selectedStops = $state<StopSelectionState[]>([]);
+	let selectedBuses = $state<MapBusSelection[]>([]);
+
+	let focusLocation = $state<[number, number] | null>(null);
+	let selectedLine = $state<string | null>(null);
+	let recentItems = $state<RecentItem[]>([]);
+	let favoriteItems = $state<FavoriteItem[]>([]);
+	let isDefaultFavorite = $state(false);
+	let nowTick = $state(Date.now());
+	let showWelcome = $state(false);
+
+	// Alertas de llegada — el Set de ids ya alertados NO es reactivo a
+	// propósito (es solo bookkeeping interno, no debe disparar renders).
+	let arrivalAlerts = $state<ArrivalAlert[]>([]);
+	let alertedBusIds = new Set<number>();
+	let alertIdCounter = 0;
+
+	// Notificaciones del sistema — segunda mitad de las alertas de
+	// llegada. Solo funciona con la pestaña abierta (foreground o
+	// background), no requiere Service Worker "push" ni backend: usa la
+	// Notification API directo desde el mismo polling que ya existe.
+	let notificationsEnabled = $state(false);
+	let notificationBlockedHint = $state(false);
+	let notificationRequesting = $state(false);
+
+	// "Cómo llegar" — independiente de la pila de selección múltiple.
+	let tripDestination = $state<TripPoint | null>(null);
+	let tripOrigin = $state<TripPoint | null>(null);
+	let locatingOrigin = $state(false);
+	let originError = $state<string | null>(null);
+	let tripOptions = $state<TripOption[] | null>(null);
+	let tripLoading = $state(false);
+	let tripSearchError = $state<string | null>(null);
+	// true mientras el usuario está en modo "elegir origen tocando el
+	// mapa/buscador" — mientras está activo, addStop/addBus/onSelectPoi/
+	// pickStopResult se redirigen a fijar origen en vez de hacer su
+	// selección normal (sumar a la pila, marcar destino, etc.).
+	let pickingOrigin = $state(false);
+
+	// Rutinas de viaje (origen/destino/días/hora guardadas en el
+	// dispositivo) y compartir viaje por link.
+	let routines = $state<Routine[]>([]);
+	let saveRoutineOpen = $state(false);
+	let shareUrl = $state<string | null>(null);
+	const heroRoutine = $derived(nextRoutine(routines, new Date(nowTick)));
+
+	interface SearchStopResult {
+		busstopId: number;
+		street1: string;
+		street2: string;
+		location: { coordinates: [number, number] };
+	}
+	interface SearchLineResult {
+		line: string;
+		origin: string;
+		destination: string;
+	}
+
+	let searchResults = $state<{ stops: SearchStopResult[]; lines: SearchLineResult[] }>({
+		stops: [],
+		lines: []
+	});
+	let searchOpen = $state(false);
+	interface GeocodeResult {
+		label: string;
+		coordinates: [number, number];
+		approximate: boolean;
+	}
+	let geocodeResults = $state<GeocodeResult[]>([]);
+	let geocodeLoading = $state(false);
+
+	function updateUrl(line: string | null) {
+		if (typeof window === 'undefined') return;
+		const url = new URL(window.location.href);
+		if (line) {
+			url.searchParams.set('line', line);
+		} else {
+			url.searchParams.delete('line');
+		}
+		url.searchParams.delete('stop');
+		window.history.replaceState({}, '', url.toString());
+	}
+
+	function saveRecent(item: RecentItem) {
+		const filtered = recentItems.filter((r) => r.id !== item.id);
+		const updated = [item, ...filtered].slice(0, 5);
+		recentItems = updated;
+		try {
+			localStorage.setItem(RECENT_KEY, JSON.stringify(updated));
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo guardar recientes', e);
+		}
+	}
+
+	function loadRecents() {
+		try {
+			const raw = localStorage.getItem(RECENT_KEY);
+			if (raw) recentItems = JSON.parse(raw);
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo leer recientes', e);
+		}
+	}
+
+	function loadFavorites() {
+		try {
+			const raw = localStorage.getItem(FAVORITES_KEY);
+			if (raw) favoriteItems = JSON.parse(raw);
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo leer favoritos', e);
+		}
+	}
+
+	function isFavorite(id: string): boolean {
+		return favoriteItems.some((f) => f.id === id);
+	}
+
+	function toggleFavorite(item: FavoriteItem) {
+		let updated: FavoriteItem[];
+		if (isFavorite(item.id)) {
+			updated = favoriteItems.filter((f) => f.id !== item.id);
+		} else {
+			updated = [item, ...favoriteItems];
+		}
+		favoriteItems = updated;
+		try {
+			localStorage.setItem(FAVORITES_KEY, JSON.stringify(updated));
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo guardar favoritos', e);
+		}
+	}
+
+	// --- Notificaciones del sistema ---
+
+	function persistNotificationsPref(value: boolean) {
+		try {
+			localStorage.setItem(NOTIFICATIONS_ENABLED_KEY, value ? '1' : '0');
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo guardar preferencia de notificaciones', e);
+		}
+	}
+
+	function loadNotificationsPref() {
+		try {
+			const raw = localStorage.getItem(NOTIFICATIONS_ENABLED_KEY);
+			// Solo lo activamos si el permiso del navegador SIGUE
+			// concedido — si el usuario lo revocó desde la configuración
+			// del sitio, no tiene sentido mostrar el toggle como activado
+			// cuando en realidad ya no va a disparar nada.
+			if (
+				raw === '1' &&
+				typeof window !== 'undefined' &&
+				'Notification' in window &&
+				Notification.permission === 'granted'
+			) {
+				notificationsEnabled = true;
+			}
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo leer preferencia de notificaciones', e);
+		}
+	}
+
+	function toggleNotifications() {
+		if (typeof window === 'undefined' || !('Notification' in window)) {
+			notificationBlockedHint = true;
+			return;
+		}
+
+		if (notificationsEnabled) {
+			notificationsEnabled = false;
+			persistNotificationsPref(false);
+			return;
+		}
+
+		if (Notification.permission === 'granted') {
+			notificationsEnabled = true;
+			persistNotificationsPref(true);
+			return;
+		}
+
+		if (Notification.permission === 'denied') {
+			// La API no permite volver a pedir permiso una vez denegado —
+			// el usuario tiene que cambiarlo a mano desde la
+			// configuración del sitio en el navegador.
+			notificationBlockedHint = true;
+			return;
+		}
+
+		notificationRequesting = true;
+		Notification.requestPermission()
+			.then((result) => {
+				if (result === 'granted') {
+					notificationsEnabled = true;
+					persistNotificationsPref(true);
+				} else {
+					notificationBlockedHint = true;
+				}
+			})
+			.finally(() => {
+				notificationRequesting = false;
+			});
+	}
+
+	function dismissNotificationBlockedHint() {
+		notificationBlockedHint = false;
+	}
+
+	/** Dispara la notificación nativa del SO — solo si el usuario la
+	 * activó Y la pestaña NO está en foco. Si está mirando la app, el
+	 * toast in-app ya cumple la misma función; duplicarlo sería ruido. */
+	function maybeShowSystemNotification(line: string, destination: string, etaMinutes: number) {
+		if (!notificationsEnabled) return;
+		if (typeof window === 'undefined' || !('Notification' in window)) return;
+		if (Notification.permission !== 'granted') return;
+		if (document.visibilityState === 'visible') return;
+
+		const minutesText = etaMinutes <= 0 ? 'menos de 1 min' : `${etaMinutes} min`;
+
+		try {
+			const notification = new Notification(`Línea ${line} está por llegar`, {
+				body: `Llega en ${minutesText} — ${destination}`,
+				tag: `bus-arrival-${line}-${Date.now()}`,
+				icon: '/web-app-manifest-192x192.png'
+			});
+			notification.onclick = () => {
+				window.focus();
+				notification.close();
+			};
+		} catch (err) {
+			console.warn('[notifications] no se pudo mostrar la notificación del sistema', err);
+		}
+	}
+
+	// --- Alertas de llegada ("bus a menos de X min") ---
+
+	function pushArrivalAlert(line: string, destination: string, etaMinutes: number) {
+		const id = `alert-${alertIdCounter++}`;
+		arrivalAlerts = [...arrivalAlerts, { id, line, destination, etaMinutes }];
+		setTimeout(() => {
+			arrivalAlerts = arrivalAlerts.filter((a) => a.id !== id);
+		}, ARRIVAL_ALERT_DURATION_MS);
+
+		maybeShowSystemNotification(line, destination, etaMinutes);
+	}
+
+	function dismissArrivalAlert(id: string) {
+		arrivalAlerts = arrivalAlerts.filter((a) => a.id !== id);
+	}
+
+	/** Revisa un listado de upcomingbuses recién llegado y dispara un
+	 * toast por cada bus que cruza el umbral por primera vez. No repite
+	 * el aviso mientras el bus se mantenga por debajo del umbral en
+	 * polls sucesivos — solo cuando entra de nuevo tras haber salido de
+	 * la lista (p. ej. otra vuelta del mismo recorrido). */
+	function checkArrivalAlerts(upcoming: UpcomingBus[]) {
+		const stillPresent = new Set<number>();
+
+		for (const bus of upcoming) {
+			stillPresent.add(bus.busId);
+			const minutes = etaToMinutes(bus.eta);
+			if (minutes < ARRIVAL_ALERT_THRESHOLD_MIN && !alertedBusIds.has(bus.busId)) {
+				alertedBusIds.add(bus.busId);
+				pushArrivalAlert(bus.line, bus.destination, minutes);
+			}
+		}
+
+		// Si un bus ya alertado desaparece del listado (llegó, pasó de
+		// largo, o simplemente ya no es "upcoming"), se libera para que
+		// pueda volver a alertar si reaparece más adelante.
+		for (const id of alertedBusIds) {
+			if (!stillPresent.has(id)) alertedBusIds.delete(id);
+		}
+	}
+
+	async function fetchUpcoming(
+		busstopId: number,
+		lines: string
+	): Promise<{ data: UpcomingBus[]; stale: boolean }> {
+		const res = await fetch(
+			`/api/busstops/${busstopId}/upcomingbuses?lines=${encodeURIComponent(lines)}`
+		);
+		const stale = res.headers.get('X-Data-Stale') === '1';
+		if (!res.ok) {
+			const errorData = await res.json().catch(() => ({}));
+			const err = new Error(errorData.message || 'No se pudieron cargar los próximos buses');
+			if (typeof errorData.retryAfterMs === 'number') {
+				(err as Error & { retryAfterMs?: number }).retryAfterMs = errorData.retryAfterMs;
+			}
+			throw err;
+		}
+		const data: UpcomingBus[] = await res.json();
+		return { data, stale };
+	}
+
+	function patchStop(busstopId: number, patch: Partial<StopSelectionState>) {
+		const stop = selectedStops.find((s) => s.busstopId === busstopId);
+		if (!stop) return;
+		Object.assign(stop, patch);
+	}
+
+	async function addStop(busstopId: number, isDefault = false) {
+		if (pickingOrigin) {
+			await pickOriginFromStop(busstopId);
+			return;
+		}
+		if (selectedStops.some((s) => s.busstopId === busstopId)) return;
+
+		selectedLine = null;
+		isDefaultFavorite = false;
+
+		const entry: StopSelectionState = {
+			busstopId,
+			detail: null,
+			upcoming: [],
+			loading: true,
+			error: '',
+			stale: false,
+			lastUpdatedAt: null,
+			isDefault,
+			retryNotBefore: null
+		};
+		selectedStops = [entry, ...selectedStops];
+		sheetOpen = true;
+
+		try {
+			const stopRes = await fetch(`/api/busstops/${busstopId}`);
+			const detailStale = stopRes.headers.get('X-Data-Stale') === '1';
+			if (!stopRes.ok) throw new Error('No se pudo cargar la parada');
+			const detail: BusStopDetail = await stopRes.json();
+
+			focusLocation = detail.location.coordinates;
+			saveRecent({
+				id: `stop-${busstopId}`,
+				type: 'stop',
+				title: `${detail.calle1} y ${detail.calle2}`,
+				busstopId
+			});
+
+			const lines = detail.lineas.join(',');
+
+			if (!lines) {
+				// La API de STM exige "lines" para upcomingbuses. Si
+				// llegamos acá sin ninguna, es porque el detalle vino del
+				// fallback (STM falló al traer el detalle real, se
+				// reconstruyó desde el listado general, que no trae
+				// líneas) — no tiene sentido pedirle a ese endpoint algo
+				// que ya sabemos que va a rechazar con 400.
+				patchStop(busstopId, {
+					detail,
+					upcoming: [],
+					stale: true,
+					loading: false,
+					error: 'No pudimos determinar qué líneas pasan por esta parada ahora mismo. Probá de nuevo en un momento.',
+					lastUpdatedAt: Date.now()
+				});
+				return;
+			}
+
+			const { data, stale } = await fetchUpcoming(busstopId, lines);
+
+			patchStop(busstopId, {
+				detail,
+				upcoming: data,
+				stale: detailStale || stale,
+				loading: false,
+				lastUpdatedAt: Date.now()
+			});
+
+			checkArrivalAlerts(data);
+		} catch (err) {
+			patchStop(busstopId, {
+				loading: false,
+				error: err instanceof Error ? err.message : 'Error desconocido'
+			});
+		}
+	}
+
+	async function refreshStop(stop: StopSelectionState) {
+		if (!stop.detail) return;
+		if (document.visibilityState === 'hidden') return;
+		if (stop.retryNotBefore && Date.now() < stop.retryNotBefore) return;
+		const lines = stop.detail.lineas.join(',');
+		if (!lines) return; // sin líneas conocidas todavía; se reintenta si el usuario vuelve a seleccionar la parada
+		try {
+			const { data, stale } = await fetchUpcoming(stop.busstopId, lines);
+			patchStop(stop.busstopId, { upcoming: data, stale, lastUpdatedAt: Date.now(), retryNotBefore: null });
+			checkArrivalAlerts(data);
+		} catch (err) {
+			console.warn('[polling] no se pudo refrescar upcomingbuses', stop.busstopId, err);
+			Sentry.captureException(err, { level: 'warning', tags: { source: 'polling.upcoming-buses' } });
+			const retryAfterMs = (err as Error & { retryAfterMs?: number }).retryAfterMs;
+			if (typeof retryAfterMs === 'number') {
+				patchStop(stop.busstopId, { retryNotBefore: Date.now() + retryAfterMs });
+			}
+		}
+	}
+
+	function removeStop(busstopId: number) {
+		selectedStops = selectedStops.filter((s) => s.busstopId !== busstopId);
+		if (selectedStops.length === 0 && selectedBuses.length === 0) sheetOpen = false;
+	}
+
+	function addBus(bus: MapBusSelection) {
+		if (pickingOrigin) {
+			setTripOrigin(`Línea ${bus.line} — ${bus.destination}`, bus.location.coordinates);
+			return;
+		}
+		if (selectedBuses.some((b) => b.busId === bus.busId)) return;
+		selectedBuses = [bus, ...selectedBuses];
+		sheetOpen = true;
+		focusLocation = bus.location.coordinates;
+	}
+
+	function removeBus(busId: number) {
+		selectedBuses = selectedBuses.filter((b) => b.busId !== busId);
+		if (selectedStops.length === 0 && selectedBuses.length === 0) sheetOpen = false;
+	}
+
+	function upcomingToMapBus(bus: UpcomingBus): MapBusSelection {
+		return {
+			busId: bus.busId,
+			line: bus.line,
+			origin: bus.origin,
+			destination: bus.destination,
+			subline: bus.subline,
+			special: bus.special,
+			company: bus.companyName,
+			speed: 0,
+			access: bus.access,
+			thermalConfort: bus.thermalConfort,
+			emissions: bus.emissions,
+			location: bus.location
+		};
+	}
+
+	function findBusEta(busId: number): number | null {
+		for (const stop of selectedStops) {
+			const match = stop.upcoming.find((b) => b.busId === busId);
+			if (match) return etaToMinutes(match.eta);
+		}
+		return null;
+	}
+
+	function clearAllSelections() {
+		selectedStops = [];
+		selectedBuses = [];
+		sheetOpen = false;
+	}
+
+	function pickStopResult(stop: SearchStopResult) {
+		searchOpen = false;
+		query = '';
+		if (pickingOrigin) {
+			setTripOrigin(`${stop.street1} y ${stop.street2}`, stop.location.coordinates);
+			return;
+		}
+		addStop(stop.busstopId);
+	}
+
+	function pickGeocodeResult(result: GeocodeResult) {
+		searchOpen = false;
+		query = '';
+		if (pickingOrigin) {
+			setTripOrigin(result.label, result.coordinates);
+			return;
+		}
+		setTripDestination(result.label, result.coordinates);
+	}
+
+	function pickLineResult(line: string, isDefault = false) {
+		searchOpen = false;
+		query = line;
+		selectedLine = line;
+		isDefaultFavorite = isDefault;
+		updateUrl(line);
+		saveRecent({
+			id: `line-${line}`,
+			type: 'line',
+			title: `Línea ${line}`,
+			line
+		});
+	}
+
+	function clearLineFilter() {
+		selectedLine = null;
+		isDefaultFavorite = false;
+		updateUrl(null);
+	}
+
+	// --- "Cómo llegar" ---
+
+	function setTripDestination(label: string, coordinates: [number, number]) {
+		tripDestination = { label, coordinates, type: 'point' };
+		pickingOrigin = false;
+		tripOptions = null;
+		tripSearchError = null;
+	}
+
+	function clearTripDestination() {
+		tripDestination = null;
+		tripOrigin = null;
+		pickingOrigin = false;
+		originError = null;
+		tripOptions = null;
+		tripSearchError = null;
+	}
+
+	function clearTripOrigin() {
+		tripOrigin = null;
+		pickingOrigin = false;
+		originError = null;
+		tripOptions = null;
+		tripSearchError = null;
+	}
+
+	function swapTrip() {
+		if (!tripOrigin || !tripDestination) return;
+		const newDestination = { ...tripOrigin, type: 'point' as const };
+		const newOrigin = { ...tripDestination, type: 'point' as const };
+		tripDestination = newDestination;
+		tripOrigin = newOrigin;
+		tripOptions = null;
+		tripSearchError = null;
+	}
+
+	/** Única función que efectivamente fija tripOrigin — la usan tanto
+	 * el GPS como cualquier punto elegido a mano (parada, bus, POI,
+	 * resultado de búsqueda), para que el reset de pickingOrigin y de
+	 * los resultados viejos de ruta pase siempre por el mismo lugar. */
+	function setTripOrigin(label: string, coordinates: [number, number], type: 'gps' | 'point' = 'point') {
+		tripOrigin = { label, coordinates, type };
+		pickingOrigin = false;
+		originError = null;
+		tripOptions = null;
+		tripSearchError = null;
+	}
+
+	function startPickOrigin() {
+		pickingOrigin = true;
+		originError = null;
+	}
+
+	function cancelPickOrigin() {
+		pickingOrigin = false;
+	}
+
+	/** Tocar una parada en el mapa mientras pickingOrigin está activo:
+	 * necesita el mismo fetch de detalle que addStop() para tener label
+	 * y coordenadas reales, pero SIN sumarla a la pila de selección. */
+	async function pickOriginFromStop(busstopId: number) {
+		try {
+			const res = await fetch(`/api/busstops/${busstopId}`);
+			if (!res.ok) throw new Error('No se pudo cargar la parada');
+			const detail: BusStopDetail = await res.json();
+			setTripOrigin(`${detail.calle1} y ${detail.calle2}`, detail.location.coordinates);
+		} catch (err) {
+			originError = err instanceof Error ? err.message : 'No se pudo usar esta parada como origen';
+			pickingOrigin = false;
+		}
+	}
+
+	function useMyLocationAsOrigin() {
+		if (!('geolocation' in navigator)) {
+			originError = 'Este navegador no soporta geolocalización.';
+			return;
+		}
+		locatingOrigin = true;
+		originError = null;
+		navigator.geolocation.getCurrentPosition(
+			(pos) => {
+				setTripOrigin('Mi ubicación', [pos.coords.longitude, pos.coords.latitude], 'gps');
+				locatingOrigin = false;
+			},
+			() => {
+				locatingOrigin = false;
+				originError = 'No se pudo obtener tu ubicación.';
+			},
+			{ enableHighAccuracy: true, timeout: 12_000, maximumAge: 30_000 }
+		);
+	}
+
+	/** Tap directo sobre un ícono del mapa base: marca ese punto como
+	 * destino y usa el GPS como origen automáticamente — acción rápida
+	 * "ir hasta acá". El origen se puede editar después con los
+	 * controles normales del panel. */
+	function selectPoiAsDestination(poi: { label: string; coordinates: [number, number] }) {
+		if (pickingOrigin) {
+			setTripOrigin(poi.label, poi.coordinates);
+			return;
+		}
+		setTripDestination(poi.label, poi.coordinates);
+		useMyLocationAsOrigin();
+	}
+
+	async function searchRoute() {
+		if (!tripOrigin || !tripDestination) return;
+		tripLoading = true;
+		tripSearchError = null;
+		tripOptions = null;
+		saveRoutineOpen = false;
+		shareUrl = null;
+		sheetOpen = true;
+
+		const params = new URLSearchParams({
+			originLat: String(tripOrigin.coordinates[1]),
+			originLng: String(tripOrigin.coordinates[0]),
+			destLat: String(tripDestination.coordinates[1]),
+			destLng: String(tripDestination.coordinates[0])
+		});
+
+		try {
+			const res = await fetch(`/api/trip-plan?${params}`);
+			if (!res.ok) throw new Error('No se pudo calcular la ruta');
+			const data: { options: TripOption[] } = await res.json();
+			tripOptions = data.options;
+		} catch (err) {
+			tripSearchError = err instanceof Error ? err.message : 'Error desconocido';
+		} finally {
+			tripLoading = false;
+		}
+	}
+
+	function closeTripResults() {
+		tripOptions = null;
+		tripSearchError = null;
+		saveRoutineOpen = false;
+		shareUrl = null;
+		if (selectedStops.length === 0 && selectedBuses.length === 0) sheetOpen = false;
+	}
+
+	// --- Rutinas ---
+
+	function planRoutine(routine: Routine) {
+		setTripOrigin(routine.originLabel, routine.origin);
+		setTripDestination(routine.destLabel, routine.dest);
+		searchRoute();
+	}
+
+	function openSaveRoutine() {
+		saveRoutineOpen = true;
+		shareUrl = null;
+	}
+
+	function handleSaveRoutine(payload: { name: string; days: number[]; time: string }) {
+		if (!tripOrigin || !tripDestination) return;
+		const routine: Routine = {
+			id: makeRoutineId(),
+			name: payload.name,
+			originLabel: tripOrigin.label,
+			origin: tripOrigin.coordinates,
+			destLabel: tripDestination.label,
+			dest: tripDestination.coordinates,
+			days: payload.days,
+			time: payload.time,
+			line: tripOptions?.[0]?.legs[0]?.line ?? null,
+			createdAt: Date.now()
+		};
+		routines = [...routines, routine];
+		saveRoutines(routines);
+		saveRoutineOpen = false;
+	}
+
+	function deleteRoutine(routine: Routine) {
+		routines = routines.filter((r) => r.id !== routine.id);
+		saveRoutines(routines);
+	}
+
+	// --- Compartir viaje ---
+
+	/** El link codifica el viaje (línea, paradas de subida/bajada,
+	 * origen/destino, expiración 1h) — la página pública calcula el ETA
+	 * en vivo contra las mismas APIs de STM, sin backend propio. */
+	function openShareTrip() {
+		if (!tripOrigin || !tripDestination || !tripOptions || tripOptions.length === 0) return;
+		const option = tripOptions[0];
+		const firstLeg = option.legs[0];
+		const lastLeg = option.legs[option.legs.length - 1];
+		const code = encodeSharedTrip({
+			v: 1,
+			line: firstLeg.line,
+			from: tripOrigin.label,
+			to: tripDestination.label,
+			o: tripOrigin.coordinates,
+			d: tripDestination.coordinates,
+			boardStopId: firstLeg.boardStop.busstopId,
+			alightStopId: lastLeg.alightStop.busstopId,
+			boardLabel: firstLeg.boardStop.label,
+			alightLabel: lastLeg.alightStop.label,
+			bs: firstLeg.boardStop.coordinates,
+			as: lastLeg.alightStop.coordinates,
+			exp: Date.now() + SHARE_TTL_MS
+		});
+		shareUrl = `${window.location.origin}/v/${code}`;
+		saveRoutineOpen = false;
+	}
+
+	onMount(() => {
+		loadRecents();
+		loadFavorites();
+		loadNotificationsPref();
+		routines = loadRoutines();
+
+		// Si ya vio el aviso de privacidad en una visita anterior
+		// (WELCOME_SEEN_KEY), arrancamos Clarity de una. Si es la
+		// primera vez, se dispara recién en dismissWelcome() — no antes
+		// de mostrarle el aviso.
+		try {
+			if (localStorage.getItem(WELCOME_SEEN_KEY)) {
+				initClarity(env.PUBLIC_CLARITY_ID);
+			}
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo leer welcome_seen para Clarity', e);
+		}
+
+		const params = new URLSearchParams(window.location.search);
+
+
+		const stopParam = params.get('stop') || params.get('parada');
+		const lineParam = params.get('line') || params.get('linea');
+
+		if (!stopParam && !lineParam) {
+			try {
+				if (!localStorage.getItem(WELCOME_SEEN_KEY)) {
+					showWelcome = true;
+				}
+			} catch (e) {
+				console.warn('[LocalStorage] no se pudo leer welcome_seen', e);
+			}
+		}
+
+		if (stopParam) {
+			const id = Number(stopParam);
+			if (!Number.isNaN(id)) addStop(id);
+		} else if (lineParam) {
+			pickLineResult(lineParam);
+		} else if (favoriteItems.length > 0) {
+			const first = favoriteItems[0];
+			if (first.type === 'stop' && first.busstopId) {
+				addStop(first.busstopId, true);
+			} else if (first.type === 'line' && first.line) {
+				pickLineResult(first.line, true);
+			}
+		}
+	});
+
+	function dismissWelcome() {
+		showWelcome = false;
+		try {
+			localStorage.setItem(WELCOME_SEEN_KEY, '1');
+		} catch (e) {
+			console.warn('[LocalStorage] no se pudo guardar welcome_seen', e);
+		}
+		initClarity(env.PUBLIC_CLARITY_ID);
+	}
+
+	$effect(() => {
+		const count = selectedStops.length;
+		if (count === 0) return;
+
+		const interval = setInterval(() => {
+			for (const stop of selectedStops) refreshStop(stop);
+		}, POLL_INTERVAL_MS);
+
+		const handleVisibility = () => {
+			if (document.visibilityState === 'visible') {
+				for (const stop of selectedStops) refreshStop(stop);
+			}
+		};
+		document.addEventListener('visibilitychange', handleVisibility);
+
+		return () => {
+			clearInterval(interval);
+			document.removeEventListener('visibilitychange', handleVisibility);
+		};
+	});
+
+	$effect(() => {
+		const tick = setInterval(() => {
+			nowTick = Date.now();
+		}, 1000);
+		return () => clearInterval(tick);
+	});
+
+	$effect(() => {
+		const q = query.trim();
+
+		if (q.length < 2) {
+			searchResults = { stops: [], lines: [] };
+			geocodeResults = [];
+			searchOpen = false;
+			return;
+		}
+
+		searchOpen = true;
+		const timeout = setTimeout(async () => {
+			try {
+				const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+				if (res.ok) searchResults = await res.json();
+
+				const hasLocalResults =
+					searchResults.stops.length > 0 || searchResults.lines.length > 0;
+				if (!hasLocalResults && q.length >= 4) {
+					geocodeLoading = true;
+					try {
+						const geoRes = await fetch(`/api/geocode?q=${encodeURIComponent(q)}`);
+						if (geoRes.ok) geocodeResults = await geoRes.json();
+					} finally {
+						geocodeLoading = false;
+					}
+				} else {
+					geocodeResults = [];
+				}
+			} catch (err) {
+				console.warn('[search] falló la búsqueda', err);
+				Sentry.captureException(err, { level: 'warning', tags: { source: 'search' } });
+			}
+		}, SEARCH_DEBOUNCE_MS);
+
+		return () => clearTimeout(timeout);
+	});
+
+	const selectedStopIds = $derived(selectedStops.map((s) => s.busstopId));
+	const selectedBusIds = $derived(selectedBuses.map((b) => b.busId));
+	const totalSelectedCount = $derived(selectedStops.length + selectedBuses.length);
+
+	const selectedStopNameStr = $derived(
+		selectedStops[0]?.detail
+			? `${selectedStops[0].detail.calle1} y ${selectedStops[0].detail.calle2}`
+			: null
+	);
+</script>
+
+<svelte:head>
+	<title>Buses Montevideo</title>
+</svelte:head>
+
+<main>
+	<BusMap
+		buses={selectedStops.flatMap((s) => s.upcoming)}
+		{focusLocation}
+		{selectedStopIds}
+		selectedStopName={selectedStopNameStr}
+		{selectedBusIds}
+		filterLine={selectedLine}
+		onSelectStop={addStop}
+		onSelectBus={addBus}
+		onSelectPoi={selectPoiAsDestination}
+		{tripOrigin}
+		{tripDestination}
+		tripOption={tripOptions?.[0] ?? null}
+	/>
+
+	<div
+		class="top-row"
+		style:--sidebar-offset={sidebarCollapsed ? '16px' : '396px'}
+	>
+		<button
+			class="collapse-btn"
+			class:collapsed={sidebarCollapsed}
+			onclick={() => (sidebarCollapsed = !sidebarCollapsed)}
+			aria-label={sidebarCollapsed ? 'Mostrar panel' : 'Ocultar panel'}
+		>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+				{#if sidebarCollapsed}
+					<polyline points="9 6 15 12 9 18" />
+				{:else}
+					<polyline points="15 6 9 12 15 18" />
+				{/if}
+			</svg>
+		</button>
+
+		<button
+			class="notif-toggle-btn"
+			class:active={notificationsEnabled}
+			class:requesting={notificationRequesting}
+			onclick={toggleNotifications}
+			aria-pressed={notificationsEnabled}
+			aria-label={notificationsEnabled ? 'Desactivar avisos del sistema' : 'Activar avisos del sistema cuando un bus está por llegar'}
+			title={notificationsEnabled ? 'Avisos del sistema activados' : 'Activar avisos del sistema'}
+		>
+			<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+				<path d="M13.73 21a2 2 0 0 1-3.46 0" />
+			</svg>
+		</button>
+
+		<div class="search-col">
+			{#if notificationBlockedHint}
+				<div class="notif-blocked-hint">
+					Los avisos del sistema están bloqueados para este sitio. Para activarlos, cambiá el permiso de notificaciones desde la configuración del navegador.
+					<button class="notif-blocked-dismiss" onclick={dismissNotificationBlockedHint} aria-label="Cerrar aviso">×</button>
+				</div>
+			{/if}
+
+			{#if arrivalAlerts.length > 0}
+				<div class="arrival-alerts" aria-live="polite">
+					{#each arrivalAlerts as alert (alert.id)}
+						<div class="arrival-alert">
+							<span class="arrival-alert-dot"></span>
+							<span class="arrival-alert-text">
+								<strong>Línea {alert.line}</strong> llega en {alert.etaMinutes <= 0 ? 'menos de 1' : alert.etaMinutes} min
+								<span class="arrival-alert-destination">→ {alert.destination}</span>
+							</span>
+							<button
+								class="arrival-alert-close"
+								onclick={() => dismissArrivalAlert(alert.id)}
+								aria-label="Cerrar aviso"
+							>
+								<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+									<line x1="18" y1="6" x2="6" y2="18" />
+									<line x1="6" y1="6" x2="18" y2="18" />
+								</svg>
+							</button>
+						</div>
+					{/each}
+				</div>
+			{/if}
+
+			<SearchBar bind:value={query} />
+
+			{#if tripDestination}
+				<TripPlannerBar
+					destination={tripDestination}
+					origin={tripOrigin}
+					{locatingOrigin}
+					{originError}
+					{pickingOrigin}
+					onUseMyLocation={useMyLocationAsOrigin}
+					onPickOnMap={startPickOrigin}
+					onCancelPickOrigin={cancelPickOrigin}
+					onClearOrigin={clearTripOrigin}
+					onClearDestination={clearTripDestination}
+					onSwap={swapTrip}
+					onSearchRoute={searchRoute}
+				/>
+			{/if}
+
+			{#if selectedLine}
+				<div class="active-filter">
+					<span class="line-chip small">{selectedLine}</span>
+					<span class="active-filter-text">
+						{isDefaultFavorite ? 'Tu línea favorita' : 'Mostrando solo esta línea'}
+					</span>
+					<button
+						class="fav-star-btn"
+						class:active={isFavorite(`line-${selectedLine}`)}
+						onclick={() =>
+							toggleFavorite({
+								id: `line-${selectedLine}`,
+								type: 'line',
+								title: `Línea ${selectedLine}`,
+								line: selectedLine!
+							})}
+						aria-label={isFavorite(`line-${selectedLine}`) ? 'Quitar de favoritos' : 'Guardar en favoritos'}
+						title={isFavorite(`line-${selectedLine}`) ? 'Quitar de favoritos' : 'Guardar en favoritos'}
+					>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill={isFavorite(`line-${selectedLine}`) ? 'var(--color-accent)' : 'none'} stroke={isFavorite(`line-${selectedLine}`) ? 'var(--color-accent)' : 'currentColor'} stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+							<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+						</svg>
+					</button>
+					<button class="close-btn" onclick={clearLineFilter} aria-label="Quitar filtro de línea">
+						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+							<line x1="18" y1="6" x2="6" y2="18" />
+							<line x1="6" y1="6" x2="18" y2="18" />
+						</svg>
+					</button>
+				</div>
+			{/if}
+
+			{#if searchOpen && (searchResults.stops.length > 0 || searchResults.lines.length > 0 || geocodeResults.length > 0 || geocodeLoading)}
+				<div class="search-dropdown">
+					{#if searchResults.lines.length > 0}
+						<div class="search-section-label">Líneas</div>
+						<div class="search-lines">
+							{#each searchResults.lines as l (l.line)}
+								<button class="line-chip line-chip-btn" onclick={() => pickLineResult(l.line)}>
+									{l.line}
+								</button>
+							{/each}
+						</div>
+					{/if}
+					{#if searchResults.stops.length > 0}
+						<div class="search-section-label">Paradas</div>
+						{#each searchResults.stops as stop (stop.busstopId)}
+							<div class="search-result-row">
+								<button class="search-result" onclick={() => pickStopResult(stop)}>
+									{stop.street1} y {stop.street2}
+								</button>
+								<button
+									class="directions-btn"
+									onclick={() => {
+										setTripDestination(`${stop.street1} y ${stop.street2}`, stop.location.coordinates);
+										searchOpen = false;
+									}}
+									aria-label="Cómo llegar hasta acá"
+									title="Cómo llegar hasta acá"
+								>
+									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+										<polygon points="3 11 22 2 13 21 11 13 3 11" />
+									</svg>
+								</button>
+							</div>
+						{/each}
+					{/if}
+				</div>
+			{:else if searchOpen}
+				<div class="search-dropdown">
+					<p class="search-empty">Sin resultados para "{query}"</p>
+				</div>
+			{/if}
+
+			{#if geocodeLoading}
+						<div class="search-section-label">Direcciones</div>
+						<p class="search-empty small">Buscando...</p>
+					{:else if geocodeResults.length > 0}
+						<div class="search-section-label">Direcciones</div>
+						{#each geocodeResults as result, i (i)}
+							<button class="search-result geocode-result" onclick={() => pickGeocodeResult(result)}>
+								<span>{result.label}</span>
+								{#if result.approximate}
+									<span class="approx-badge" title="Este punto agrupa varias numeraciones del mismo edificio en OpenStreetMap; puede no ser exacto para el número buscado.">
+										aprox.
+									</span>
+								{/if}
+							</button>
+						{/each}
+						<p class="geocode-attribution">Direcciones © colaboradores de OpenStreetMap</p>
+					{/if}
+		</div>
+	</div>
+
+	<BottomSheet open={sheetOpen} bind:collapsed={sidebarCollapsed}>
+		{#if tripLoading || tripSearchError || tripOptions !== null}
+			<TripResultsCard
+				loading={tripLoading}
+				error={tripSearchError}
+				options={tripOptions ?? []}
+				onClose={closeTripResults}
+				onSaveRoutine={tripOrigin && tripDestination ? openSaveRoutine : undefined}
+				onShareTrip={tripOrigin && tripDestination ? openShareTrip : undefined}
+			/>
+			{#if saveRoutineOpen && tripOrigin && tripDestination}
+				<SaveRoutineCard
+					originLabel={tripOrigin.label}
+					destLabel={tripDestination.label}
+					onSave={handleSaveRoutine}
+					onCancel={() => (saveRoutineOpen = false)}
+				/>
+			{/if}
+			{#if shareUrl}
+				<ShareTripCard url={shareUrl} onClose={() => (shareUrl = null)} />
+			{/if}
+		{:else if totalSelectedCount > 0}
+			<div class="selection-stack">
+				{#if totalSelectedCount > 1}
+					<div class="stack-toolbar">
+						<span class="stack-count tabular-nums">{totalSelectedCount} seleccionados</span>
+						<button class="clear-all-btn" onclick={clearAllSelections}>Limpiar todo</button>
+					</div>
+				{/if}
+
+				{#each selectedBuses as bus (bus.busId)}
+					<div class="stack-card">
+						<div class="panel-header">
+							<div class="panel-header-left">
+								<button
+									class="fav-star-btn"
+									class:active={isFavorite(`line-${bus.line}`)}
+									onclick={() =>
+										toggleFavorite({
+											id: `line-${bus.line}`,
+											type: 'line',
+											title: `Línea ${bus.line}`,
+											line: bus.line
+										})}
+									aria-label={isFavorite(`line-${bus.line}`) ? 'Quitar línea de favoritos' : 'Guardar línea en favoritos'}
+									title={isFavorite(`line-${bus.line}`) ? 'Quitar línea de favoritos' : 'Guardar línea en favoritos'}
+								>
+									<svg width="16" height="16" viewBox="0 0 24 24" fill={isFavorite(`line-${bus.line}`) ? 'var(--color-accent)' : 'none'} stroke={isFavorite(`line-${bus.line}`) ? 'var(--color-accent)' : 'currentColor'} stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+										<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+									</svg>
+								</button>
+								<h2 class="panel-title">Ómnibus en vivo</h2>
+							</div>
+							<button
+								class="directions-btn"
+								onclick={() => setTripDestination(`Línea ${bus.line} — ${bus.destination}`, bus.location.coordinates)}
+								aria-label="Cómo llegar hasta este ómnibus"
+								title="Cómo llegar hasta acá"
+							>
+								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+									<polygon points="3 11 22 2 13 21 11 13 3 11" />
+								</svg>
+							</button>
+							<button class="close-btn" onclick={() => removeBus(bus.busId)} aria-label="Cerrar ómnibus">
+								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+									<line x1="18" y1="6" x2="6" y2="18" />
+									<line x1="6" y1="6" x2="18" y2="18" />
+								</svg>
+							</button>
+						</div>
+						<BusDetailCard
+							line={bus.line}
+							destination={bus.destination}
+							origin={bus.origin}
+							company={bus.company}
+							speed={bus.speed}
+							access={bus.access}
+							thermalConfort={bus.thermalConfort}
+							emissions={bus.emissions}
+							etaMinutes={findBusEta(bus.busId)}
+							busId={bus.busId}
+						/>
+					</div>
+				{/each}
+
+				{#each selectedStops as stop (stop.busstopId)}
+					<div class="stack-card">
+						{#if stop.loading}
+							<p class="status">Cargando...</p>
+							{:else if stop.detail}
+							<div class="stop-header">
+								<div class="stop-header-title">
+									<button
+										class="fav-star-btn"
+										class:active={isFavorite(`stop-${stop.detail.paradaId}`)}
+										onclick={() =>
+											toggleFavorite({
+												id: `stop-${stop.detail!.paradaId}`,
+												type: 'stop',
+												title: `${stop.detail!.calle1} y ${stop.detail!.calle2}`,
+												busstopId: stop.detail!.paradaId
+											})}
+										aria-label={isFavorite(`stop-${stop.detail.paradaId}`) ? 'Quitar parada de favoritos' : 'Guardar parada en favoritos'}
+										title={isFavorite(`stop-${stop.detail.paradaId}`) ? 'Quitar de favoritos' : 'Guardar en favoritos'}
+									>
+										<svg width="18" height="18" viewBox="0 0 24 24" fill={isFavorite(`stop-${stop.detail.paradaId}`) ? 'var(--color-accent)' : 'none'} stroke={isFavorite(`stop-${stop.detail.paradaId}`) ? 'var(--color-accent)' : 'currentColor'} stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+											<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+										</svg>
+									</button>
+									<div class="stop-title-col">
+										{#if stop.isDefault}
+											<span class="favorite-kicker">Tu parada favorita</span>
+										{/if}
+										<h2 class="stop-name">{stop.detail.calle1} y {stop.detail.calle2}</h2>
+									</div>
+								</div>
+								<div class="stop-header-right">
+									{#if stop.lastUpdatedAt !== null}
+										<span class="updated tabular-nums">
+											{stop.stale ? 'Datos demorados · ' : ''}hace {Math.max(0, Math.round((nowTick - stop.lastUpdatedAt) / 1000))}s
+										</span>
+									{/if}
+									<button
+										class="directions-btn"
+										onclick={() => setTripDestination(`${stop.detail!.calle1} y ${stop.detail!.calle2}`, stop.detail!.location.coordinates)}
+										aria-label="Cómo llegar hasta esta parada"
+										title="Cómo llegar hasta acá"
+									>
+										<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+											<polygon points="3 11 22 2 13 21 11 13 3 11" />
+										</svg>
+									</button>
+									<button class="close-btn" onclick={() => removeStop(stop.busstopId)} aria-label="Cerrar parada">
+										<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+											<line x1="18" y1="6" x2="6" y2="18" />
+											<line x1="6" y1="6" x2="18" y2="18" />
+										</svg>
+									</button>
+								</div>
+							</div>
+							{#if stop.error}
+								<p class="status error">{stop.error}</p>
+							{:else if stop.upcoming.length === 0}
+								<p class="status">No hay buses acercándose ahora mismo.</p>
+							{:else}
+								{#each stop.upcoming as bus (bus.busId)}
+									<LineEtaCard
+										line={bus.line}
+										destination={bus.destination}
+										etaMinutes={etaToMinutes(bus.eta)}
+										highlight={selectedBuses.some((b) => b.busId === bus.busId)}
+										onSelect={() => addBus(upcomingToMapBus(bus))}
+									/>
+								{/each}
+							{/if}
+							{:else if stop.error}
++							<p class="status error">{stop.error}</p>
+						{/if}
+					</div>
+				{/each}
+			</div>
+		{:else if selectedLine}
+			<div class="line-only-panel">
+				<div class="line-only-badge">{selectedLine}</div>
+				<div class="line-only-text">
+					{#if isDefaultFavorite}
+						<span class="favorite-kicker">Tu línea favorita</span>
+					{/if}
+					<p class="line-only-message">
+						Mostrando la línea {selectedLine} en el mapa. Tocá un ómnibus para ver el detalle, o elegí una parada.
+					</p>
+				</div>
+			</div>
+		{:else}
+			{#if heroRoutine}
+				<div class="routine-section-label">Tu próxima salida</div>
+				<RoutineHero routine={heroRoutine} {nowTick} onPlan={planRoutine} />
+			{/if}
+			<RoutinesSection
+				routines={routines.filter((r) => r.id !== heroRoutine?.id)}
+				onPlan={planRoutine}
+				onDelete={deleteRoutine}
+			/>
+			<EmptyStateCard
+				favorites={favoriteItems}
+				recents={recentItems}
+				onPick={(item) => {
+					if (item.type === 'stop' && item.busstopId) addStop(item.busstopId);
+					else if (item.type === 'line' && item.line) pickLineResult(item.line);
+				}}
+			/>
+		{/if}
+	</BottomSheet>
+
+	{#if showWelcome}
+		<WelcomeModal onClose={dismissWelcome} />
+	{/if}
+</main>
+
+<style>
+	main {
+		position: relative;
+		width: 100%;
+		height: 100dvh;
+		overflow: hidden;
+	}
+
+	.arrival-alerts {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-2);
+		margin-bottom: var(--space-2);
+	}
+
+	.arrival-alert {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		background: rgba(19, 27, 46, 0.97);
+		backdrop-filter: blur(12px);
+		-webkit-backdrop-filter: blur(12px);
+		border: 1px solid var(--color-live);
+		border-radius: var(--radius-md);
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+		padding: var(--space-3);
+		animation: arrival-alert-in 0.25s ease;
+	}
+
+	@keyframes arrival-alert-in {
+		from {
+			opacity: 0;
+			transform: translateY(-8px);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0);
+		}
+	}
+
+	.arrival-alert-dot {
+		flex-shrink: 0;
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--color-live);
+		box-shadow: 0 0 0 0 rgba(94, 234, 212, 0.5);
+		animation: pulse 2s infinite;
+	}
+
+	@keyframes pulse {
+		0% {
+			box-shadow: 0 0 0 0 rgba(94, 234, 212, 0.5);
+		}
+		70% {
+			box-shadow: 0 0 0 6px rgba(94, 234, 212, 0);
+		}
+		100% {
+			box-shadow: 0 0 0 0 rgba(94, 234, 212, 0);
+		}
+	}
+
+	.arrival-alert-text {
+		flex: 1;
+		min-width: 0;
+		font-size: 13px;
+		color: var(--color-text);
+		line-height: 1.4;
+	}
+
+	.arrival-alert-destination {
+		display: block;
+		font-size: 11px;
+		color: var(--color-text-secondary);
+	}
+
+	.arrival-alert-close {
+		flex-shrink: 0;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 22px;
+		height: 22px;
+		background: none;
+		border: none;
+		color: var(--color-text-secondary);
+		cursor: pointer;
+		border-radius: var(--radius-sm);
+	}
+
+	.arrival-alert-close:hover {
+		background: rgba(245, 246, 248, 0.08);
+		color: var(--color-text);
+	}
+
+	.notif-blocked-hint {
+		display: flex;
+		align-items: flex-start;
+		gap: var(--space-2);
+		background: #7f1d1d;
+		color: white;
+		font-size: 12px;
+		line-height: 1.4;
+		padding: var(--space-3);
+		border-radius: var(--radius-md);
+		margin-bottom: var(--space-2);
+	}
+
+	.notif-blocked-dismiss {
+		flex-shrink: 0;
+		background: none;
+		border: none;
+		color: white;
+		font-size: 16px;
+		line-height: 1;
+		cursor: pointer;
+		padding: 0;
+	}
+
+	.top-row {
+		position: absolute;
+		top: env(safe-area-inset-top, 0);
+		left: 0;
+		right: 0;
+		padding: var(--space-4);
+		z-index: 10;
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+	}
+
+	.collapse-btn {
+		display: none;
+	}
+
+	.notif-toggle-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 36px;
+		height: 36px;
+		flex-shrink: 0;
+		background: var(--color-surface);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-sm);
+		color: var(--color-text-secondary);
+		cursor: pointer;
+		transition:
+			color 0.15s ease,
+			border-color 0.15s ease;
+	}
+
+	.notif-toggle-btn:hover {
+		color: var(--color-text);
+	}
+
+	.notif-toggle-btn.active {
+		color: var(--color-live);
+		border-color: var(--color-live);
+	}
+
+	.notif-toggle-btn.requesting {
+		animation: locate-pulse 1.1s ease-in-out infinite;
+	}
+
+	@keyframes locate-pulse {
+		0%,
+		100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.4;
+		}
+	}
+
+	.search-col {
+		flex: 1;
+		min-width: 0;
+	}
+
+	@media (min-width: 900px) {
+		.top-row {
+			left: var(--sidebar-offset, 396px);
+			right: auto;
+			transition: left 0.22s ease;
+		}
+
+		.collapse-btn {
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			width: 36px;
+			height: 36px;
+			flex-shrink: 0;
+			background: var(--color-surface);
+			border: 1px solid var(--color-border);
+			border-radius: var(--radius-sm);
+			color: var(--color-text);
+			cursor: pointer;
+		}
+
+		.search-col {
+			width: 420px;
+		}
+	}
+
+	.search-dropdown {
+		margin-top: var(--space-2);
+		background: rgba(19, 27, 46, 0.95);
+		backdrop-filter: blur(12px);
+		-webkit-backdrop-filter: blur(12px);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+		max-height: 340px;
+		overflow-y: auto;
+		padding: var(--space-2);
+	}
+
+	.search-section-label {
+		font-size: 11px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--color-text-secondary);
+		padding: var(--space-2) var(--space-2) var(--space-1);
+	}
+
+	.search-lines {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--space-2);
+		padding: 0 var(--space-2) var(--space-2);
+	}
+
+	.line-chip {
+		background: var(--color-accent);
+		color: var(--color-bg);
+		font-weight: 700;
+		font-size: 13px;
+		padding: 4px var(--space-2);
+		border-radius: var(--radius-sm);
+	}
+
+	.line-chip-btn {
+		border: none;
+		cursor: pointer;
+		font-family: var(--font-sans);
+		transition: transform 0.1s ease;
+	}
+
+	.line-chip-btn:hover {
+		transform: scale(1.08);
+	}
+
+	.line-chip.small {
+		font-size: 12px;
+		padding: 3px 6px;
+	}
+
+	.active-filter {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		margin-top: var(--space-2);
+		background: rgba(19, 27, 46, 0.95);
+		backdrop-filter: blur(12px);
+		-webkit-backdrop-filter: blur(12px);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		padding: var(--space-2) var(--space-3);
+	}
+
+	.active-filter-text {
+		flex: 1;
+		font-size: 12px;
+		color: var(--color-text-secondary);
+	}
+
+	.fav-star-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		background: none;
+		border: none;
+		color: var(--color-text-secondary);
+		cursor: pointer;
+		padding: 4px;
+		border-radius: var(--radius-sm);
+		transition: transform 0.15s ease, color 0.15s ease;
+	}
+
+	.fav-star-btn:hover {
+		color: var(--color-accent);
+		transform: scale(1.15);
+	}
+
+	.fav-star-btn.active {
+		color: var(--color-accent);
+	}
+
+	.directions-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		width: 24px;
+		height: 24px;
+		background: none;
+		border: none;
+		color: var(--color-text-secondary);
+		cursor: pointer;
+		border-radius: var(--radius-sm);
+		transition: color 0.15s ease;
+	}
+
+	.directions-btn:hover {
+		color: var(--color-live);
+		background: rgba(94, 234, 212, 0.1);
+	}
+
+	.search-result-row {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+	}
+
+	.search-result-row .search-result {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.stop-header-title,
+	.panel-header-left {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		min-width: 0;
+	}
+
+	.stop-title-col {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		min-width: 0;
+	}
+
+	.favorite-kicker {
+		font-size: 10px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--color-accent);
+	}
+
+	.line-only-panel {
+		display: flex;
+		align-items: flex-start;
+		gap: var(--space-3);
+		padding: var(--space-4);
+		background: var(--color-surface-raised);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+	}
+
+	.line-only-badge {
+		flex-shrink: 0;
+		min-width: 48px;
+		height: 40px;
+		padding: 0 var(--space-2);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: var(--color-accent);
+		color: var(--color-bg);
+		font-weight: 800;
+		font-size: 15px;
+		border-radius: var(--radius-sm);
+	}
+
+	.line-only-text {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		min-width: 0;
+	}
+
+	.line-only-message {
+		margin: 0;
+		font-size: 13px;
+		color: var(--color-text-secondary);
+		line-height: 1.5;
+	}
+
+	.search-result {
+		display: block;
+		width: 100%;
+		text-align: left;
+		background: none;
+		border: none;
+		color: var(--color-text);
+		font-size: 14px;
+		font-weight: 500;
+		padding: var(--space-2);
+		border-radius: var(--radius-sm);
+		cursor: pointer;
+	}
+
+	.search-result:hover,
+	.search-result:focus-visible {
+		background: rgba(245, 246, 248, 0.06);
+	}
+
+	.search-empty {
+		color: var(--color-text-secondary);
+		font-size: 13px;
+		text-align: center;
+		padding: var(--space-3);
+		margin: 0;
+	}
+
+	.search-empty.small {
+		padding: var(--space-2);
+		font-size: 12px;
+	}
+
+	.geocode-attribution {
+		font-size: 10px;
+		color: var(--color-text-secondary);
+		opacity: 0.6;
+		text-align: center;
+		margin: var(--space-2) 0 0;
+		padding-top: var(--space-2);
+		border-top: 1px solid var(--color-border);
+	}
+
+	.geocode-result {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-2);
+	}
+
+	.approx-badge {
+		flex-shrink: 0;
+		font-size: 10px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		color: var(--color-accent);
+		background: rgba(255, 201, 60, 0.12);
+		padding: 2px 6px;
+		border-radius: 999px;
+		cursor: help;
+	}
+
+	.selection-stack {
+		display: flex;
+		flex-direction: column;
+	}
+
+	.stack-toolbar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: var(--space-4);
+	}
+
+	.stack-count {
+		font-size: 11px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--color-text-secondary);
+	}
+
+	.clear-all-btn {
+		background: none;
+		border: none;
+		color: var(--color-accent);
+		font-size: 12px;
+		font-weight: 600;
+		cursor: pointer;
+		padding: 4px 6px;
+		border-radius: var(--radius-sm);
+	}
+
+	.clear-all-btn:hover {
+		background: rgba(255, 201, 60, 0.1);
+	}
+
+	.stack-card:not(:first-child) {
+		margin-top: var(--space-5);
+		padding-top: var(--space-5);
+		border-top: 1px solid var(--color-border);
+	}
+
+	.stop-header {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: var(--space-2);
+		margin-bottom: var(--space-3);
+	}
+
+	.panel-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-2);
+		margin-bottom: var(--space-3);
+	}
+
+	.panel-title {
+		font-size: 13px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--color-text-secondary);
+		margin: 0;
+	}
+
+	.stop-name {
+		font-size: 17px;
+		font-weight: 700;
+		margin: 0;
+	}
+
+	.stop-header-right {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		flex-shrink: 0;
+	}
+
+	.close-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 24px;
+		height: 24px;
+		background: none;
+		border: none;
+		color: var(--color-text-secondary);
+		cursor: pointer;
+		border-radius: var(--radius-sm);
+	}
+
+	.close-btn:hover {
+		background: rgba(245, 246, 248, 0.08);
+		color: var(--color-text);
+	}
+
+	.updated {
+		font-size: 11px;
+		color: var(--color-text-secondary);
+		white-space: nowrap;
+	}
+
+	.status {
+		color: var(--color-text-secondary);
+		font-size: 14px;
+		text-align: center;
+		margin: var(--space-4) 0;
+	}
+
+	.status.error {
+		color: #f87171;
+	}
+	.routine-section-label {
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--color-text-secondary);
+		margin: 0 2px var(--space-2);
+	}
+</style>
