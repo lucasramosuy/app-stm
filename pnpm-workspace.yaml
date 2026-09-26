@@ -2,5 +2,8 @@ allowBuilds:
   '@sentry/cli': true
   esbuild: true
 
+overrides:
+  cookie: ^0.7.2
+
 packages:
   - '.'
