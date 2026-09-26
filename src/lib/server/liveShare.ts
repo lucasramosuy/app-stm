@@ -9,8 +9,11 @@
 // - Escribir o borrar exige además el token de escritura, que solo
 //   conoce el dispositivo que comparte.
 // - No hay historial: cada actualización pisa la posición anterior.
-// - Al expirar, la primera lectura borra la sesión (lazy delete) y el
-//   blob se guarda con metadata.expiration como red de seguridad.
+// - La lectura/escritura reporta la sesión expirada como inexistente
+//   pero NO la borra: una instancia de la función con el reloj corrido
+//   (observado en prod 26/9 — lecturas que mataban sesiones vivas al
+//   ~1 min) no puede destruir datos para todos. El borrado queda en
+//   DELETE (emisor) y el blob lleva metadata.expiration como red.
 //
 // Storage: Netlify Blobs en producción (incluido en todos los planes;
 // consume del pool de 300 créditos/mes del plan Free, que tiene límite
@@ -141,7 +144,9 @@ export async function readLiveShare(
 	const record = await store.get(id);
 	if (!record) return null;
 	if (now > record.expiresAt) {
-		await store.delete(id).catch(() => {});
+		// Expirada se ve como inexistente, pero no se borra en lectura
+		// (ver header): el borrado es responsabilidad del emisor (DELETE)
+		// y de la metadata de expiración.
 		return null;
 	}
 	return { position: record.position, updatedAt: record.updatedAt, expiresAt: record.expiresAt };
@@ -160,10 +165,7 @@ export async function updateLiveSharePosition(
 ): Promise<WriteResult> {
 	const record = await store.get(id);
 	if (!record) return 'not_found';
-	if (now > record.expiresAt) {
-		await store.delete(id).catch(() => {});
-		return 'not_found';
-	}
+	if (now > record.expiresAt) return 'not_found'; // expirada ≠ borrada (ver header)
 	if (record.token !== token) return 'forbidden';
 	await store.set(id, { ...record, position, updatedAt: now });
 	return 'ok';

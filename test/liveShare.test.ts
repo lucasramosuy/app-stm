@@ -78,14 +78,15 @@ describe('sesiones de ubicación en vivo', () => {
 		expect(await updateLiveSharePosition(store, session.id, session.token, POS, T0 + 61 * 60_000)).toBe('not_found');
 	});
 
-	it('expirada: lectura devuelve null y borra la sesión (lazy delete)', async () => {
+	it('expirada: lectura devuelve null pero NO borra la sesión', async () => {
 		const store = createMemoryStore();
 		const session = await createLiveShare(store, T0);
 		await updateLiveSharePosition(store, session.id, session.token, POS, T0);
 
 		expect(await readLiveShare(store, session.id, T0 + LIVE_SHARE_TTL_MS + 1)).toBeNull();
-		// borrada de verdad: ni con token se puede seguir escribiendo
-		expect(await deleteLiveShare(store, session.id, session.token)).toBe('not_found');
+		// No se borra en lectura: una instancia con el reloj corrido no
+		// puede destruir la sesión. El token de escritura sigue mandando.
+		expect(await deleteLiveShare(store, session.id, session.token)).toBe('ok');
 	});
 
 	it('escribir o borrar con token incorrecto es forbidden', async () => {
