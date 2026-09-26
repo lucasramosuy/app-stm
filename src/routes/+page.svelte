@@ -35,7 +35,7 @@
 		nextRoutine,
 		type Routine
 	} from '$lib/routines';
-	import { encodeSharedTrip, SHARE_TTL_MS } from '$lib/shareTrip';
+	import { encodeSharedTrip, SHARE_TTL_MS, type SharedTrip } from '$lib/shareTrip';
 	import { etaToMinutes, type BusStopDetail, type UpcomingBus } from '$lib/types/stm';
 	import type { TripOption } from '$lib/types/trip';
 	import { initClarity } from '$lib/analytics/clarity';
@@ -729,13 +729,16 @@
 
 	/** El link codifica el viaje (línea, paradas de subida/bajada,
 	 * origen/destino, expiración 1h) — la página pública calcula el ETA
-	 * en vivo contra las mismas APIs de STM, sin backend propio. */
-	function openShareTrip() {
-		if (!tripOrigin || !tripDestination || !tripOptions || tripOptions.length === 0) return;
-		const option = tripOptions[0];
+	 * en vivo contra las mismas APIs de STM. */
+	function buildSharedTrip(
+		option: TripOption,
+		exp: number,
+		liveId?: string
+	): SharedTrip | null {
+		if (!tripOrigin || !tripDestination) return null;
 		const firstLeg = option.legs[0];
 		const lastLeg = option.legs[option.legs.length - 1];
-		const code = encodeSharedTrip({
+		return {
 			v: 1,
 			line: firstLeg.line,
 			from: tripOrigin.label,
@@ -748,10 +751,165 @@
 			alightLabel: lastLeg.alightStop.label,
 			bs: firstLeg.boardStop.coordinates,
 			as: lastLeg.alightStop.coordinates,
-			exp: Date.now() + SHARE_TTL_MS
-		});
-		shareUrl = `${window.location.origin}/v/${code}`;
+			liveId,
+			exp
+		};
+	}
+
+	function openShareTrip() {
+		if (!tripOptions || tripOptions.length === 0) return;
+		const trip = buildSharedTrip(tripOptions[0], Date.now() + SHARE_TTL_MS);
+		if (!trip) return;
+		shareUrl = `${window.location.origin}/v/${encodeSharedTrip(trip)}`;
 		saveRoutineOpen = false;
+	}
+
+	// --- Compartir ubicación en vivo ---
+	// Sesión efímera (TTL 1h fijo, sin historial) creada en el backend
+	// chico de /api/live-share. El teléfono sube su posición cada ~10 s
+	// (o cuando se movió más de ~25 m) mientras el viaje está activo;
+	// quien abre el link la ve moverse en el mapa. Se corta manual, al
+	// terminar el viaje o solo a la hora.
+	let liveShare = $state<{ id: string; token: string; url: string; expiresAt: number } | null>(
+		null
+	);
+	let liveShareBusy = $state(false);
+	let liveShareError = $state<string | null>(null);
+	// Bookkeeping no reactivo (igual que tripGpsWatchId).
+	let liveGpsWatchId: number | null = null;
+	let livePollId: ReturnType<typeof setInterval> | null = null;
+	let lastLivePostAt = 0;
+	let lastLivePostPos: [number, number] | null = null;
+
+	const LIVE_POST_MIN_INTERVAL_MS = 10_000;
+	const LIVE_POST_MAX_INTERVAL_MS = 45_000;
+	const LIVE_POST_MIN_MOVE_M = 25;
+
+	async function postLivePosition(position: [number, number]) {
+		if (!liveShare) return;
+		const { id, token } = liveShare;
+		try {
+			const res = await fetch(`/api/live-share/${id}`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ token, position })
+			});
+			if (res.status === 410 || res.status === 404) {
+				// La sesión ya no existe del lado del servidor (expiró).
+				stopLiveShare(false);
+				liveShareError = 'La sesión de compartir expiró.';
+				return;
+			}
+			if (res.ok) {
+				lastLivePostAt = Date.now();
+				lastLivePostPos = position;
+			}
+		} catch (e) {
+			console.warn('[compartir-en-vivo] no se pudo subir la posición', e);
+		}
+	}
+
+	function handleLivePosition(coords: [number, number]) {
+		if (!liveShare) return;
+		const now = Date.now();
+		const elapsed = now - lastLivePostAt;
+		if (elapsed < LIVE_POST_MIN_INTERVAL_MS) return;
+		const moved = lastLivePostPos ? distanceMeters(lastLivePostPos, coords) : Infinity;
+		if (moved >= LIVE_POST_MIN_MOVE_M || elapsed >= LIVE_POST_MAX_INTERVAL_MS) {
+			void postLivePosition(coords);
+		}
+	}
+
+	function startLiveGpsWatch() {
+		if (!('geolocation' in navigator)) return;
+		if (liveGpsWatchId === null) {
+			liveGpsWatchId = navigator.geolocation.watchPosition(
+				(pos) => handleLivePosition([pos.coords.longitude, pos.coords.latitude]),
+				(err) => console.warn('[compartir-en-vivo] error de GPS', err),
+				{ enableHighAccuracy: true, timeout: 15_000, maximumAge: 5_000 }
+			);
+		}
+		// Red de seguridad: el watch se duerme en algunos navegadores
+		// (pestaña en segundo plano, ahorro de batería); este poll
+		// garantiza un fix fresco cada ~15 s mientras la sesión vive.
+		if (livePollId === null) {
+			livePollId = setInterval(() => {
+				navigator.geolocation.getCurrentPosition(
+					(pos) => handleLivePosition([pos.coords.longitude, pos.coords.latitude]),
+					() => {},
+					{ enableHighAccuracy: true, timeout: 10_000, maximumAge: 0 }
+				);
+			}, 15_000);
+		}
+	}
+
+	function stopLiveGpsWatch() {
+		if (liveGpsWatchId !== null && typeof navigator !== 'undefined' && 'geolocation' in navigator) {
+			navigator.geolocation.clearWatch(liveGpsWatchId);
+		}
+		liveGpsWatchId = null;
+		if (livePollId !== null) {
+			clearInterval(livePollId);
+			livePollId = null;
+		}
+	}
+
+	async function startLiveShare() {
+		if (!activeTrip || liveShare || liveShareBusy) return;
+		if (!('geolocation' in navigator)) {
+			liveShareError = 'Este navegador no soporta geolocalización.';
+			return;
+		}
+		liveShareBusy = true;
+		liveShareError = null;
+		try {
+			// Pedimos un fix antes de crear la sesión: si el usuario niega
+			// el GPS no queda una sesión huérfana esperando expirar.
+			const fix = await new Promise<GeolocationPosition>((resolve, reject) =>
+				navigator.geolocation.getCurrentPosition(resolve, reject, {
+					enableHighAccuracy: true,
+					timeout: 15_000
+				})
+			);
+			const res = await fetch('/api/live-share', { method: 'POST' });
+			if (!res.ok) throw new Error(`create respondió ${res.status}`);
+			const session: { id: string; token: string; expiresAt: number } = await res.json();
+			const trip = buildSharedTrip(activeTrip.option, session.expiresAt, session.id);
+			if (!trip) throw new Error('sin viaje activo');
+			liveShare = {
+				id: session.id,
+				token: session.token,
+				url: `${window.location.origin}/v/${encodeSharedTrip(trip)}`,
+				expiresAt: session.expiresAt
+			};
+			shareUrl = null;
+			lastLivePostAt = 0;
+			lastLivePostPos = null;
+			await postLivePosition([fix.coords.longitude, fix.coords.latitude]);
+			startLiveGpsWatch();
+		} catch (e) {
+			console.warn('[compartir-en-vivo] no se pudo iniciar', e);
+			liveShareError =
+				'No pudimos acceder a tu ubicación: activá el GPS para compartirla en vivo.';
+		} finally {
+			liveShareBusy = false;
+		}
+	}
+
+	function stopLiveShare(notifyServer = true) {
+		stopLiveGpsWatch();
+		if (liveShare && notifyServer) {
+			const { id, token } = liveShare;
+			// Mejor esfuerzo: si falla, la sesión expira sola a la hora.
+			fetch(`/api/live-share/${id}`, {
+				method: 'DELETE',
+				headers: { 'x-live-share-token': token },
+				keepalive: true
+			}).catch(() => {});
+		}
+		liveShare = null;
+		lastLivePostAt = 0;
+		lastLivePostPos = null;
 	}
 
 	// --- Viaje activo + avisos del viaje ---
@@ -813,6 +971,8 @@
 
 	function endTrip() {
 		if (!activeTrip) return;
+		stopLiveShare();
+		liveShareError = null;
 		activeTrip = null;
 		currentLegIndex = 0;
 		tripAlerts = [];
@@ -822,6 +982,14 @@
 		firedProximityAlerts.clear();
 		stopTripGpsWatch();
 	}
+
+	// La sesión tiene TTL fijo de 1h: cuando se cumple, se corta sola.
+	$effect(() => {
+		if (liveShare && nowTick > liveShare.expiresAt) {
+			stopLiveShare(false);
+			liveShareError = 'La sesión de una hora expiró.';
+		}
+	});
 
 	function toggleTripAlerts() {
 		tripAlertsEnabled = !tripAlertsEnabled;
@@ -1354,6 +1522,11 @@
 				onToggleAlerts={toggleTripAlerts}
 				onDismissAlert={dismissTripAlert}
 				onShare={openShareTrip}
+				liveShare={liveShare ? { url: liveShare.url, expiresAt: liveShare.expiresAt } : null}
+				liveBusy={liveShareBusy}
+				liveError={liveShareError}
+				onShareLive={startLiveShare}
+				onStopLive={() => stopLiveShare()}
 				onEnd={endTrip}
 			/>
 			{#if shareUrl}

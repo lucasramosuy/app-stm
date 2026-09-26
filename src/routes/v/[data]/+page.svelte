@@ -7,9 +7,17 @@
 	import type { TripOption } from '$lib/types/trip';
 
 	const POLL_MS = 20_000;
+	const LIVE_POLL_MS = 5_000;
 
 	const trip: SharedTrip | null = $derived(decodeSharedTrip($page.params.data ?? ''));
 	const expired = $derived(trip !== null && Date.now() > trip.exp);
+
+	// Sesión de ubicación en vivo (si el link la incluye): posición de
+	// quien comparte, traída cada pocos segundos de /api/live-share.
+	const liveId = $derived(trip?.liveId ?? null);
+	let livePos = $state<[number, number] | null>(null);
+	let liveUpdatedAt = $state<number | null>(null);
+	let liveEnded = $state(false);
 
 	// Opción de viaje sintética (un solo tramo) para que el mapa dibuje
 	// el recorrido, las caminatas y los puntos de origen/destino.
@@ -83,6 +91,10 @@
 		trip ? new Date(trip.exp).toLocaleTimeString('es-UY', { hour: '2-digit', minute: '2-digit' }) : ''
 	);
 
+	const liveAgeS = $derived(
+		liveUpdatedAt !== null ? Math.max(0, Math.round((nowTick - liveUpdatedAt) / 1000)) : null
+	);
+
 	async function refreshEta() {
 		if (!trip?.alightStopId) return;
 		try {
@@ -95,13 +107,40 @@
 		}
 	}
 
+	async function pollLivePosition() {
+		if (!liveId || liveEnded) return;
+		try {
+			const res = await fetch(`/api/live-share/${liveId}`);
+			if (res.status === 404 || res.status === 410) {
+				// La persona dejó de compartir o la sesión expiró: no
+				// vuelve con el mismo id, dejamos de preguntar.
+				liveEnded = true;
+				livePos = null;
+				return;
+			}
+			if (res.ok) {
+				const data: { position: [number, number] | null; updatedAt: number } = await res.json();
+				livePos = data.position;
+				liveUpdatedAt = data.updatedAt;
+			}
+		} catch (e) {
+			console.warn('[viaje-compartido] no se pudo refrescar la ubicación en vivo', e);
+		}
+	}
+
 	onMount(() => {
 		refreshEta();
 		const poll = setInterval(refreshEta, POLL_MS);
 		const tick = setInterval(() => (nowTick = Date.now()), 1_000);
+		let livePoll: ReturnType<typeof setInterval> | null = null;
+		if (liveId) {
+			pollLivePosition();
+			livePoll = setInterval(pollLivePosition, LIVE_POLL_MS);
+		}
 		return () => {
 			clearInterval(poll);
 			clearInterval(tick);
+			if (livePoll) clearInterval(livePoll);
 		};
 	});
 </script>
@@ -144,6 +183,7 @@
 			tripOption={tripOption}
 			tripOrigin={{ coordinates: trip.o }}
 			tripDestination={{ coordinates: trip.d }}
+			sharedUserPosition={livePos && !liveEnded ? { coordinates: livePos } : null}
 		/>
 
 		<div class="topfade"></div>
@@ -156,7 +196,9 @@
 			<span class="brand-name-lg">Buses Montevideo</span>
 		</header>
 		<div class="banner-row">
-			<span class="banner-pill">Te compartieron un viaje en vivo</span>
+			<span class="banner-pill">
+				{liveId ? 'Te compartieron su ubicación en vivo' : 'Te compartieron un viaje en vivo'}
+			</span>
 		</div>
 
 		<section class="sheet">
@@ -187,12 +229,25 @@
 			<div class="meta-row">
 				<span class="line-badge">{trip.line}</span>
 				<span class="meta-text">
-					Línea {trip.line}{#if distanceLabel} · {distanceLabel}{/if}
+					{#if liveId}
+						Va en el {trip.line}{#if liveEnded}{' '}
+							· <span class="live-off">ubicación en vivo finalizada</span>
+						{:else if liveAgeS !== null && livePos}{' '}
+							· actualizado hace {liveAgeS} s
+						{:else}{' '}
+							· esperando la primera señal…
+						{/if}
+					{:else}
+						Línea {trip.line}{#if distanceLabel} · {distanceLabel}{/if}
+					{/if}
 				</span>
 			</div>
 
 			<a class="open-btn" href="/">Abrir en la app</a>
-			<p class="exp-note">Link temporal · deja de actualizarse a las {expLabel}</p>
+			<p class="exp-note">
+				Link temporal · deja de actualizarse a las {expLabel}{#if liveId}{' '}
+					o cuando termine el viaje{/if}
+			</p>
 		</section>
 	{/if}
 </main>
@@ -426,6 +481,10 @@
 		font-size: 15px;
 		font-weight: 700;
 		text-decoration: none;
+	}
+
+	.live-off {
+		color: var(--color-text-secondary);
 	}
 
 	.exp-note {
