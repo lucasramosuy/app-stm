@@ -10,6 +10,18 @@
 	import WelcomeModal from '$lib/components/WelcomeModal.svelte';
 	import TripPlannerBar from '$lib/components/TripPlannerBar.svelte';
 	import TripResultsCard from '$lib/components/TripResultsCard.svelte';
+	import RoutineHero from '$lib/components/RoutineHero.svelte';
+	import RoutinesSection from '$lib/components/RoutinesSection.svelte';
+	import SaveRoutineCard from '$lib/components/SaveRoutineCard.svelte';
+	import ShareTripCard from '$lib/components/ShareTripCard.svelte';
+	import {
+		loadRoutines,
+		saveRoutines,
+		makeRoutineId,
+		nextRoutine,
+		type Routine
+	} from '$lib/routines';
+	import { encodeSharedTrip, SHARE_TTL_MS } from '$lib/shareTrip';
 	import { etaToMinutes, type BusStopDetail, type UpcomingBus } from '$lib/types/stm';
 	import type { TripOption } from '$lib/types/trip';
 	import { initClarity } from '$lib/analytics/clarity';
@@ -105,6 +117,13 @@
 	// pickStopResult se redirigen a fijar origen en vez de hacer su
 	// selección normal (sumar a la pila, marcar destino, etc.).
 	let pickingOrigin = $state(false);
+
+	// Rutinas de viaje (origen/destino/días/hora guardadas en el
+	// dispositivo) y compartir viaje por link.
+	let routines = $state<Routine[]>([]);
+	let saveRoutineOpen = $state(false);
+	let shareUrl = $state<string | null>(null);
+	const heroRoutine = $derived(nextRoutine(routines, new Date(nowTick)));
 
 	interface SearchStopResult {
 		busstopId: number;
@@ -658,6 +677,8 @@
 		tripLoading = true;
 		tripSearchError = null;
 		tripOptions = null;
+		saveRoutineOpen = false;
+		shareUrl = null;
 		sheetOpen = true;
 
 		const params = new URLSearchParams({
@@ -682,13 +703,82 @@
 	function closeTripResults() {
 		tripOptions = null;
 		tripSearchError = null;
+		saveRoutineOpen = false;
+		shareUrl = null;
 		if (selectedStops.length === 0 && selectedBuses.length === 0) sheetOpen = false;
+	}
+
+	// --- Rutinas ---
+
+	function planRoutine(routine: Routine) {
+		setTripOrigin(routine.originLabel, routine.origin);
+		setTripDestination(routine.destLabel, routine.dest);
+		searchRoute();
+	}
+
+	function openSaveRoutine() {
+		saveRoutineOpen = true;
+		shareUrl = null;
+	}
+
+	function handleSaveRoutine(payload: { name: string; days: number[]; time: string }) {
+		if (!tripOrigin || !tripDestination) return;
+		const routine: Routine = {
+			id: makeRoutineId(),
+			name: payload.name,
+			originLabel: tripOrigin.label,
+			origin: tripOrigin.coordinates,
+			destLabel: tripDestination.label,
+			dest: tripDestination.coordinates,
+			days: payload.days,
+			time: payload.time,
+			line: tripOptions?.[0]?.legs[0]?.line ?? null,
+			createdAt: Date.now()
+		};
+		routines = [...routines, routine];
+		saveRoutines(routines);
+		saveRoutineOpen = false;
+	}
+
+	function deleteRoutine(routine: Routine) {
+		routines = routines.filter((r) => r.id !== routine.id);
+		saveRoutines(routines);
+	}
+
+	// --- Compartir viaje ---
+
+	/** El link codifica el viaje (línea, paradas de subida/bajada,
+	 * origen/destino, expiración 1h) — la página pública calcula el ETA
+	 * en vivo contra las mismas APIs de STM, sin backend propio. */
+	function openShareTrip() {
+		if (!tripOrigin || !tripDestination || !tripOptions || tripOptions.length === 0) return;
+		const option = tripOptions[0];
+		const firstLeg = option.legs[0];
+		const lastLeg = option.legs[option.legs.length - 1];
+		const code = encodeSharedTrip({
+			v: 1,
+			line: firstLeg.line,
+			from: tripOrigin.label,
+			to: tripDestination.label,
+			o: tripOrigin.coordinates,
+			d: tripDestination.coordinates,
+			boardStopId: firstLeg.boardStop.busstopId,
+			alightStopId: lastLeg.alightStop.busstopId,
+			boardLabel: firstLeg.boardStop.label,
+			alightLabel: lastLeg.alightStop.label,
+			bs: firstLeg.boardStop.coordinates,
+			as: lastLeg.alightStop.coordinates,
+			exp: Date.now() + SHARE_TTL_MS
+		});
+		shareUrl = `${window.location.origin}/v/${code}`;
+		saveRoutineOpen = false;
 	}
 
 	onMount(() => {
 		loadRecents();
 		loadFavorites();
 		loadNotificationsPref();
+		routines = loadRoutines();
 
 		// Si ya vio el aviso de privacidad en una visita anterior
 		// (WELCOME_SEEN_KEY), arrancamos Clarity de una. Si es la
@@ -1026,7 +1116,20 @@
 				error={tripSearchError}
 				options={tripOptions ?? []}
 				onClose={closeTripResults}
+				onSaveRoutine={tripOrigin && tripDestination ? openSaveRoutine : undefined}
+				onShareTrip={tripOrigin && tripDestination ? openShareTrip : undefined}
 			/>
+			{#if saveRoutineOpen && tripOrigin && tripDestination}
+				<SaveRoutineCard
+					originLabel={tripOrigin.label}
+					destLabel={tripDestination.label}
+					onSave={handleSaveRoutine}
+					onCancel={() => (saveRoutineOpen = false)}
+				/>
+			{/if}
+			{#if shareUrl}
+				<ShareTripCard url={shareUrl} onClose={() => (shareUrl = null)} />
+			{/if}
 		{:else if totalSelectedCount > 0}
 			<div class="selection-stack">
 				{#if totalSelectedCount > 1}
@@ -1180,6 +1283,15 @@
 				</div>
 			</div>
 		{:else}
+			{#if heroRoutine}
+				<div class="routine-section-label">Tu próxima salida</div>
+				<RoutineHero routine={heroRoutine} {nowTick} onPlan={planRoutine} />
+			{/if}
+			<RoutinesSection
+				routines={routines.filter((r) => r.id !== heroRoutine?.id)}
+				onPlan={planRoutine}
+				onDelete={deleteRoutine}
+			/>
 			<EmptyStateCard
 				favorites={favoriteItems}
 				recents={recentItems}
@@ -1764,5 +1876,13 @@
 
 	.status.error {
 		color: #f87171;
+	}
+	.routine-section-label {
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--color-text-secondary);
+		margin: 0 2px var(--space-2);
 	}
 </style>
