@@ -637,7 +637,11 @@
 				const list: LiveBus[] = await res.json();
 				syncBuses(list);
 				if (lastFitLine !== line) {
-					fitToBuses(list);
+					// Con un viaje en pantalla (el planificador o la página
+					// pública /v), el encuadre lo manda el trazado del viaje.
+					// Si acá encuadramos por línea y este fetch vuelve
+					// después que el del viaje, le pisa el fitBounds.
+					if (!tripOption) fitToBuses(list);
 					lastFitLine = line;
 				}
 			}
