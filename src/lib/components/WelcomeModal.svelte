@@ -59,7 +59,7 @@
 		<button class="start-btn" onclick={() => onClose?.()}>Entendido</button>
 
 		<p class="privacy-note">
-			Usamos datos de uso para mejorar la app.
+			Uso datos de uso para mejorar la app.
 			<a href="/privacidad">Más información</a>
 		</p>
 	</div>

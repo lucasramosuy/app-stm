@@ -9,7 +9,7 @@
 	<p class="updated">Última actualización: agosto de 2026</p>
 
 	<section>
-		<h2>Qué datos recolectamos</h2>
+		<h2>Qué datos recolecto</h2>
 		<p>
 			Buses Montevideo usa <strong>Microsoft Clarity</strong> para entender cómo
 			se usa la app: qué partes de la pantalla se tocan, cómo se navega el mapa
@@ -17,16 +17,16 @@
 			(movimientos, taps, scroll) y mapas de calor agregados.
 		</p>
 		<p>
-			También usamos <strong>Sentry</strong> para recibir reportes automáticos
-			de errores técnicos, y para que puedas enviarnos manualmente un problema
+			También uso <strong>Sentry</strong> para recibir reportes automáticos
+			de errores técnicos, y para que puedas enviarme manualmente un problema
 			o una sugerencia desde el botón de reporte dentro de la app.
 		</p>
 	</section>
 
 	<section>
-		<h2>Qué NO recolectamos</h2>
+		<h2>Qué NO recolecto</h2>
 		<p>
-			No pedimos registro ni cuentas de usuario. No accedemos a tu ubicación
+			No pido registro ni cuentas de usuario. No accedo a tu ubicación
 			salvo que vos actives explícitamente "Mi ubicación" para planificar un
 			viaje, y en ese caso la coordenada se usa solo para ese cálculo, no se
 			guarda asociada a vos.
@@ -38,7 +38,7 @@
 		<p>
 			Los datos de uso van a los servidores de Microsoft (Clarity) y Sentry (errores),
 			ambos como proveedores de servicio, no como terceros con fines propios de
-			publicidad. No vendemos ni compartimos datos con otras empresas.
+			publicidad. No vendo ni comparto datos con otras empresas.
 		</p>
 	</section>
 
@@ -55,7 +55,7 @@
 		<h2>Contacto</h2>
 		<p>
 			Para consultas sobre estos datos, usá el botón de reporte dentro de la
-			app o escribinos a través del repositorio del proyecto en GitHub.
+			app o escribime a través del repositorio del proyecto en GitHub.
 		</p>
 	</section>
 </main>
