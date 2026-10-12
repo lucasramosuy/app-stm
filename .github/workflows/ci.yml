@@ -12,10 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # pnpm/setup reemplaza a pnpm/action-setup + actions/setup-node en
-      # un solo paso (instala pnpm y Node juntos). Si tu package.json
-      # tiene el campo "packageManager" (ej. "pnpm@9.x.x"), lo detecta
-      # solo y podés borrar la línea "version:" de abajo.
+      # pnpm/setup instala pnpm y Node juntos.
       - uses: pnpm/setup@v2
         with:
           version: 11
@@ -31,3 +28,6 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      - name: Tests (vitest)
+        run: pnpm test
