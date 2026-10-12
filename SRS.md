@@ -1,6 +1,6 @@
 # Especificación de requisitos de software: App STM
 
-**Estado:** código de `master` al 27/09/2026 (`a210e1d`). Este documento registra el alcance implementado; el roadmap del README no se convierte automáticamente en requisito vigente.
+**Estado:** código de `master` al 12/10/2026 (`aafb270`; desde el 27/09 solo cambiaron README y textos de bienvenida y privacidad). Este documento registra el alcance implementado; el roadmap del README no se convierte automáticamente en requisito vigente.
 
 ## Propósito y usuarios
 
