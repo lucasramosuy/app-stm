@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { page } from '$app/stores';
+	import { page } from '$app/state';
 	import BusMap from '$lib/components/BusMap.svelte';
 	import { decodeSharedTrip, type SharedTrip } from '$lib/shareTrip';
 	import { etaToMinutes, type UpcomingBus } from '$lib/types/stm';
@@ -9,7 +9,7 @@
 	const POLL_MS = 20_000;
 	const LIVE_POLL_MS = 5_000;
 
-	const trip: SharedTrip | null = $derived(decodeSharedTrip($page.params.data ?? ''));
+	const trip: SharedTrip | null = $derived(decodeSharedTrip(page.params.data ?? ''));
 	const expired = $derived(trip !== null && Date.now() > trip.exp);
 
 	// Sesión de ubicación en vivo (si el link la incluye): posición de

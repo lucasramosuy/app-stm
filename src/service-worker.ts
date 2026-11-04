@@ -3,7 +3,11 @@
 /// <reference lib="esnext" />
 /// <reference lib="webworker" />
 
-import { build, files, version } from '$service-worker';
+// `$service-worker` ya no existe en kit 3: los assets vienen de
+// `$app/manifest` (sin barra inicial, hay que prefijar '/') y la versión
+// del build de `$app/env`.
+import { immutable, assets } from '$app/manifest';
+import { version } from '$app/env';
 
 // Redeclarar `self` con el tipo correcto para este contexto — sin esto,
 // TypeScript lo sigue viendo como el `self` de una página normal (tipo
@@ -16,7 +20,7 @@ const CACHE_NAME = `app-shell-${version}`;
 // estáticos de /static (íconos, manifest, fuentes). Los tiles del mapa
 // (OpenFreeMap) y cualquier /api/* quedan afuera a propósito — ver
 // comentarios más abajo.
-const ASSETS_TO_CACHE = [...build, ...files];
+const ASSETS_TO_CACHE = [...immutable, ...assets].map((a) => `/${a.path}`);
 
 self.addEventListener('install', (event) => {
 	event.waitUntil(

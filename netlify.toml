@@ -1,5 +1,9 @@
 [build]
   command = "pnpm run build"
+
+[build.environment]
+  # kit 3 exige Node >= 22
+  NODE_VERSION = "22"
   publish = "build"
 
 [functions]

@@ -16,6 +16,10 @@ export default defineConfig({
 			}
 		}),
 		sveltekit({
+			// Escape hatch de kit 3 para seguir usando imports `$lib/...`
+			// (68 imports en ~35 archivos). Deja un warning de deprecado;
+			// la migración real a `#lib` con extensión explícita queda como deuda.
+			alias: { $lib: 'src/lib' },
 			compilerOptions: {
 				runes: ({ filename }) =>
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true
