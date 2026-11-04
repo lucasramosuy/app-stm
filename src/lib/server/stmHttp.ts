@@ -1,4 +1,4 @@
-import { json, type NumericRange } from '@sveltejs/kit';
+import { json } from '@sveltejs/kit';
 import { StmDataUnavailableError, type StmCacheResult } from './stmCache';
 import { StmApiError } from './stmApi';
 
@@ -27,14 +27,14 @@ export function handleStmError(err: unknown): ReturnType<typeof json> {
 	if (err instanceof StmDataUnavailableError) {
 		return json(
 			{ error: 'data_unavailable', message: err.message, retryAfterMs: err.retryAfterMs },
-			{ status: err.httpStatus as NumericRange<400, 599> }
+			{ status: err.httpStatus }
 		);
 	}
 	if (err instanceof StmApiError) {
 		const status = err.status >= 400 && err.status < 600 ? err.status : 503;
 		return json(
 			{ error: 'stm_api_error', message: err.message, status: err.status },
-			{ status: status as NumericRange<400, 599> }
+			{ status: status }
 		);
 	}
 	console.error('[API Handler Error]', err);
